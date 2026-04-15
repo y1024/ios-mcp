@@ -88,6 +88,22 @@ http://设备IP:8090/health
 - `run_command` 工具可执行任意 Shell 命令，请谨慎使用
 - `mcp-root` 提供 root 提权能力，仅限包内工具使用
 
+## 社区交流
+
+`iOS MCP` 已经聚集了不少开发者和用户持续交流，目前已建立多个微信交流群。
+
+| 微信交流群（6群开放中） | 公众号 |
+|---|---|
+| 1群：已满<br>2群：已满<br>3群：已满<br>4群：已满<br>5群：已满<br>6群：开放中 | `移动端Android和iOS开发技术分享` |
+| <img src="https://raw.githubusercontent.com/witchan/Imgur/main/group6_qr.JPG" alt="iOS MCP 微信 6 群二维码" width="260"> | <img src="prefs/Resources/wechat_qr.jpg" alt="移动端Android和iOS开发技术分享 公众号二维码" width="220"> |
+
+> 6群二维码如已过期，请添加微信 `witchan028` 或关注公众号 `移动端Android和iOS开发技术分享` 获取最新入群方式。
+
+欢迎添加微信或关注公众号，获取最新动态与入群方式。
+
+- 微信：`witchan028`
+- 邮箱：`witchan028@126.com`
+
 ## 作者
 
 **witchan**

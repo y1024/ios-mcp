@@ -87,6 +87,22 @@ After installation, open **Settings** → **iOS MCP** on your device. Start the 
 - The `run_command` tool can execute arbitrary shell commands — use with caution
 - `mcp-root` provides root privilege elevation, intended for internal use only
 
+## Community
+
+`iOS MCP` already has an active community of developers and users, with multiple WeChat groups available for discussion.
+
+| WeChat Groups (Group 6 Open) | Official Account |
+|---|---|
+| Group 1: Full<br>Group 2: Full<br>Group 3: Full<br>Group 4: Full<br>Group 5: Full<br>Group 6: Open | `移动端Android和iOS开发技术分享` |
+| <img src="https://raw.githubusercontent.com/witchan/Imgur/main/group6_qr.JPG" alt="iOS MCP WeChat Group 6 QR Code" width="260"> | <img src="prefs/Resources/wechat_qr.jpg" alt="WeChat Official Account QR Code" width="220"> |
+
+> If the Group 6 QR code has expired, add WeChat `witchan028` or follow the official account `移动端Android和iOS开发技术分享` to get the latest group invite.
+
+Feel free to add me on WeChat or follow the official account for updates and the latest group access information.
+
+- WeChat: `witchan028`
+- Email: `witchan028@126.com`
+
 ## Author
 
 **witchan**
