@@ -809,7 +809,12 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         @{
             @"name": @"screenshot",
             @"description": @"Take a screenshot. Returns MCP image content, not text: result.content[0].type is image, mimeType is usually image/jpeg, and data contains the base64 JPEG payload compressed under about 400KB.",
-            @"inputSchema": @{@"type": @"object", @"properties": @{}}
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"debug": @{@"type": @"boolean", @"description": @"Include diagnostic screenshot source metadata (default: false)"}
+                }
+            }
         },
         // ---- Clipboard tools ----
         @{
@@ -869,7 +874,12 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         @{
             @"name": @"get_frontmost_app",
             @"description": @"Get the bundle identifier and name of the currently foreground app",
-            @"inputSchema": @{@"type": @"object", @"properties": @{}}
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"debug": @{@"type": @"boolean", @"description": @"Include resolver and AX diagnostic metadata (default: false)"}
+                }
+            }
         },
         // ---- Accessibility tools ----
         @{
@@ -881,7 +891,8 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                     @"visible_only": @{@"type": @"boolean", @"description": @"Include only nodes whose rect intersects the current screen (default: true)"},
                     @"clickable_only": @{@"type": @"boolean", @"description": @"Include only hittable/clickable nodes (default: false)"},
                     @"limit": @{@"type": @"integer", @"description": @"Max returned elements after filtering (default: no extra limit)"},
-                    @"max_elements": @{@"type": @"integer", @"description": @"Max elements to return (default: 2000)"}
+                    @"max_elements": @{@"type": @"integer", @"description": @"Max elements to return (default: 2000)"},
+                    @"debug": @{@"type": @"boolean", @"description": @"Include AX runtime, resolver, and candidate diagnostics (default: false)"}
                 }
             }
         },
@@ -892,7 +903,8 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                 @"type": @"object",
                 @"properties": @{
                     @"x": @{@"type": @"number", @"description": @"X coordinate in screen points"},
-                    @"y": @{@"type": @"number", @"description": @"Y coordinate in screen points"}
+                    @"y": @{@"type": @"number", @"description": @"Y coordinate in screen points"},
+                    @"debug": @{@"type": @"boolean", @"description": @"Include AX runtime and resolver diagnostics (default: false)"}
                 },
                 @"required": @[@"x", @"y"]
             }
@@ -1296,8 +1308,11 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 }
 
 - (NSDictionary *)executeScreenshot:(id)reqId args:(NSDictionary *)args {
-    (void)args;
+    NSString *paramError = nil;
     BOOL debug = NO;
+    if (!MCPBoolFromArgs(args, @"debug", NO, &debug, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
 
     NSDictionary *payload = [[ScreenManager sharedInstance] takeScreenshotPayload];
     NSString *base64 = payload[@"data"];
@@ -1402,8 +1417,11 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 }
 
 - (NSDictionary *)executeGetFrontmostApp:(id)reqId args:(NSDictionary *)args {
-    (void)args;
+    NSString *paramError = nil;
     BOOL debug = NO;
+    if (!MCPBoolFromArgs(args, @"debug", NO, &debug, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
 
     NSDictionary *info = [[AppManager sharedInstance] getFrontmostApp];
     NSDictionary *responseInfo = [self sanitizeFrontmostInfo:info debug:debug];
@@ -1621,7 +1639,8 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     if (!MCPNumberFromArgs(args, @"max_elements", 0, NO, &maxElementsValue, &paramError) ||
         !MCPNumberFromArgs(args, @"limit", 0, NO, &limitValue, &paramError) ||
         !MCPBoolFromArgs(args, @"visible_only", YES, &visibleOnly, &paramError) ||
-        !MCPBoolFromArgs(args, @"clickable_only", NO, &clickableOnly, &paramError)) {
+        !MCPBoolFromArgs(args, @"clickable_only", NO, &clickableOnly, &paramError) ||
+        !MCPBoolFromArgs(args, @"debug", NO, &debug, &paramError)) {
         return [self mcpError:reqId code:-32602 message:paramError];
     }
     NSInteger maxElements = (NSInteger)maxElementsValue;
@@ -1694,7 +1713,8 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     double y = 0;
     BOOL debug = NO;
     if (!MCPNumberFromArgs(args, @"x", 0, YES, &x, &paramError) ||
-        !MCPNumberFromArgs(args, @"y", 0, YES, &y, &paramError)) {
+        !MCPNumberFromArgs(args, @"y", 0, YES, &y, &paramError) ||
+        !MCPBoolFromArgs(args, @"debug", NO, &debug, &paramError)) {
         return [self mcpError:reqId code:-32602 message:paramError];
     }
 
