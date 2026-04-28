@@ -19,6 +19,7 @@
 #import <mach/mach.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <dlfcn.h>
 
 #define MCP_PROTOCOL_VERSION @"2025-03-26"
 #define MCP_SERVER_NAME      @"ios-mcp"
@@ -1313,7 +1314,6 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
     if (!MCPBoolFromArgs(args, @"debug", NO, &debug, &paramError)) {
         return [self mcpError:reqId code:-32602 message:paramError];
     }
-
     NSDictionary *payload = [[ScreenManager sharedInstance] takeScreenshotPayload];
     NSString *base64 = payload[@"data"];
     NSString *mimeType = payload[@"mimeType"] ?: @"image/jpeg";
@@ -2120,11 +2120,62 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 
 #pragma mark - Brightness Execution
 
+typedef float (*MCPBKSDisplayBrightnessGetCurrentFunc)(void);
+typedef void (*MCPBKSDisplayBrightnessSetFunc)(float brightness, Boolean commit);
+
+static void MCPLoadBackBoardBrightnessSymbols(MCPBKSDisplayBrightnessGetCurrentFunc *outGet,
+                                              MCPBKSDisplayBrightnessSetFunc *outSet) {
+    static dispatch_once_t onceToken;
+    static MCPBKSDisplayBrightnessGetCurrentFunc getFunc = NULL;
+    static MCPBKSDisplayBrightnessSetFunc setFunc = NULL;
+    dispatch_once(&onceToken, ^{
+        void *handle = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_LAZY);
+        if (!handle) {
+            handle = RTLD_DEFAULT;
+        }
+        getFunc = (MCPBKSDisplayBrightnessGetCurrentFunc)dlsym(handle, "BKSDisplayBrightnessGetCurrent");
+        if (!getFunc) {
+            getFunc = (MCPBKSDisplayBrightnessGetCurrentFunc)dlsym(handle, "PSBKSDisplayBrightnessGetCurrent");
+        }
+        setFunc = (MCPBKSDisplayBrightnessSetFunc)dlsym(handle, "BKSDisplayBrightnessSet");
+        if (!setFunc) {
+            setFunc = (MCPBKSDisplayBrightnessSetFunc)dlsym(handle, "PSBKSDisplayBrightnessSet");
+        }
+    });
+    if (outGet) *outGet = getFunc;
+    if (outSet) *outSet = setFunc;
+}
+
+static BOOL MCPGetSystemBrightness(CGFloat *outBrightness) {
+    MCPBKSDisplayBrightnessGetCurrentFunc getFunc = NULL;
+    MCPLoadBackBoardBrightnessSymbols(&getFunc, NULL);
+    if (getFunc) {
+        float value = getFunc();
+        if (isfinite(value) && value >= 0.0f && value <= 1.0f) {
+            if (outBrightness) *outBrightness = (CGFloat)value;
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL MCPSetSystemBrightness(CGFloat brightness) {
+    MCPBKSDisplayBrightnessSetFunc setFunc = NULL;
+    MCPLoadBackBoardBrightnessSymbols(NULL, &setFunc);
+    if (setFunc) {
+        setFunc((float)brightness, true);
+        return YES;
+    }
+    return NO;
+}
+
 - (NSDictionary *)executeGetBrightness:(id)reqId {
     __block CGFloat brightness = 0;
 
     dispatch_block_t block = ^{
-        brightness = [UIScreen mainScreen].brightness;
+        if (!MCPGetSystemBrightness(&brightness)) {
+            brightness = [UIScreen mainScreen].brightness;
+        }
     };
 
     if ([NSThread isMainThread]) {
@@ -2150,6 +2201,7 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 
     __block BOOL ok = NO;
     dispatch_block_t block = ^{
+        ok = MCPSetSystemBrightness((CGFloat)level);
         [UIScreen mainScreen].brightness = (CGFloat)level;
         ok = YES;
     };

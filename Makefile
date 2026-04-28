@@ -15,7 +15,7 @@ BUNDLE_NAME = iosmcpprefs
 
 ios-mcp_FILES = Tweak.x MCPServer.m HIDManager.m ScreenManager.m ClipboardManager.m AppManager.m AccessibilityManager.m TextInputManager.m MCPProcessUtil.m MCPAXQueryContext.m MCPAXRemoteContextResolver.m MCPUIElementSerializer.m MCPUIElementsFacade.m MCPAXAttributeBridge.m MCPAXNodeSource.m
 ios-mcp_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-deprecated-declarations
-ios-mcp_FRAMEWORKS = IOKit UIKit CoreGraphics QuartzCore MobileCoreServices AVFoundation Security Accessibility
+ios-mcp_FRAMEWORKS = IOKit UIKit CoreGraphics QuartzCore MobileCoreServices AVFoundation Security
 
 ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
     ios-mcp_LIBRARIES = roothide
@@ -30,22 +30,6 @@ iosmcpprefs_PRIVATE_FRAMEWORKS = Preferences
 iosmcpprefs_LDFLAGS = -F$(THEOS)/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks
 iosmcpprefs_INSTALL_PATH = /Library/PreferenceBundles
 iosmcpprefs_RESOURCE_DIRS = prefs/Resources
-iosmcpprefs_USE_MODULES = 0
-
-# 正式包启用 OLLVM；测试包保持关闭，方便调试和缩短构建时间。
-ifeq ($(FINALPACKAGE),1)
-    ifneq ($(DEBUG),1)
-		# ollvm相关配置
-		OLLVMNAME = LLVM19.0.0git
-		TARGET_CC = /Applications/Xcode.app/Contents/Developer/Toolchains/$(OLLVMNAME).xctoolchain/usr/bin/clang
-		TARGET_CXX = /Applications/Xcode.app/Contents/Developer/Toolchains/$(OLLVMNAME).xctoolchain/usr/bin/clang++
-		TARGET_LD = /Applications/Xcode.app/Contents/Developer/Toolchains/$(OLLVMNAME).xctoolchain/usr/bin/clang++
-		OLLVMPASS = -mllvm -enable-bcfobf -mllvm -enable-cffobf -mllvm -enable-splitobf -mllvm -enable-subobf -mllvm -enable-indibran -mllvm -enable-strcry -mllvm -enable-funcwra -mllvm -enable-fco
-		ios-mcp_USE_MODULES = 0
-        ios-mcp_CFLAGS += $(OLLVMPASS)
-        ios-mcp_CXXFLAGS += $(OLLVMPASS)
-    endif
-endif
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 include $(THEOS_MAKE_PATH)/bundle.mk
