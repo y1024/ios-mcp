@@ -22,7 +22,7 @@
 
 #define MCP_PROTOCOL_VERSION @"2025-03-26"
 #define MCP_SERVER_NAME      @"ios-mcp"
-#define MCP_SERVER_VERSION   @"1.0.0"
+#define MCP_SERVER_VERSION   @"1.0.1"
 #define HTTP_BUF_SIZE        (256 * 1024)
 #define MCP_UPLOAD_DIR       @"/tmp/ios-mcp-uploads"
 #define MCP_MAX_UPLOAD_BYTES (500LL * 1024LL * 1024LL)

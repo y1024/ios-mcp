@@ -32,15 +32,20 @@ iosmcpprefs_INSTALL_PATH = /Library/PreferenceBundles
 iosmcpprefs_RESOURCE_DIRS = prefs/Resources
 iosmcpprefs_USE_MODULES = 0
 
-# ollvm相关配置
-OLLVMNAME = LLVM19.0.0git
-TARGET_CC = /Applications/Xcode.app/Contents/Developer/Toolchains/$(OLLVMNAME).xctoolchain/usr/bin/clang
-TARGET_CXX = /Applications/Xcode.app/Contents/Developer/Toolchains/$(OLLVMNAME).xctoolchain/usr/bin/clang++
-TARGET_LD = /Applications/Xcode.app/Contents/Developer/Toolchains/$(OLLVMNAME).xctoolchain/usr/bin/clang++
-OLLVMPASS = -mllvm -enable-bcfobf -mllvm -enable-cffobf -mllvm -enable-splitobf -mllvm -enable-subobf -mllvm -enable-indibran -mllvm -enable-strcry -mllvm -enable-funcwra -mllvm -enable-fco
-ios-mcp_USE_MODULES = 0
-ios-mcp_CFLAGS += $(OLLVMPASS)
-ios-mcp_CXXFLAGS += $(OLLVMPASS)
+# 正式包启用 OLLVM；测试包保持关闭，方便调试和缩短构建时间。
+ifeq ($(FINALPACKAGE),1)
+    ifneq ($(DEBUG),1)
+		# ollvm相关配置
+		OLLVMNAME = LLVM19.0.0git
+		TARGET_CC = /Applications/Xcode.app/Contents/Developer/Toolchains/$(OLLVMNAME).xctoolchain/usr/bin/clang
+		TARGET_CXX = /Applications/Xcode.app/Contents/Developer/Toolchains/$(OLLVMNAME).xctoolchain/usr/bin/clang++
+		TARGET_LD = /Applications/Xcode.app/Contents/Developer/Toolchains/$(OLLVMNAME).xctoolchain/usr/bin/clang++
+		OLLVMPASS = -mllvm -enable-bcfobf -mllvm -enable-cffobf -mllvm -enable-splitobf -mllvm -enable-subobf -mllvm -enable-indibran -mllvm -enable-strcry -mllvm -enable-funcwra -mllvm -enable-fco
+		ios-mcp_USE_MODULES = 0
+        ios-mcp_CFLAGS += $(OLLVMPASS)
+        ios-mcp_CXXFLAGS += $(OLLVMPASS)
+    endif
+endif
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 include $(THEOS_MAKE_PATH)/bundle.mk
