@@ -6,6 +6,8 @@
 #import "AccessibilityManager.h"
 #import "MCPProcessUtil.h"
 #import "TextInputManager.h"
+#import "FileSystemManager.h"
+#import "LogManager.h"
 #import "MCPLogger.h"
 #import <UIKit/UIKit.h>
 #import <sys/socket.h>
@@ -17,6 +19,7 @@
 #import <stdlib.h>
 #import <sys/utsname.h>
 #import <sys/statvfs.h>
+#import <sys/stat.h>
 #import <sys/wait.h>
 #import <mach/mach.h>
 #import <objc/runtime.h>
@@ -331,7 +334,13 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"get_device_info",
             @"get_clipboard",
             @"get_brightness",
-            @"get_volume"
+            @"get_volume",
+            @"get_app_info",
+            @"list_dir",
+            @"read_file",
+            @"get_syslog",
+            @"get_crash_logs",
+            @"read_crash_log"
         ];
     });
     return tools;
@@ -440,6 +449,9 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                    initialBodyLength:(ssize_t)initialBodyLength
                         clientSocket:(int)clientSocket
                          requestLogId:(NSString *)requestLogId;
+- (void)handleDownloadFileRequestPath:(NSString *)path
+                         clientSocket:(int)clientSocket
+                         requestLogId:(NSString *)requestLogId;
 - (NSData *)readChunkedMCPBodyFromSocket:(int)clientSocket
                              initialBody:(const char *)initialBody
                        initialBodyLength:(ssize_t)initialBodyLength
@@ -482,6 +494,13 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 - (NSDictionary *)executeSetVolume:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeInstallApp:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeUninstallApp:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeGetAppInfo:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeListDir:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeReadFile:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeWriteFile:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeGetSyslog:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeGetCrashLogs:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeReadCrashLog:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)sanitizeFrontmostInfo:(NSDictionary *)info debug:(BOOL)debug;
 - (NSDictionary *)sanitizeUIElementsPayload:(NSDictionary *)payload debug:(BOOL)debug;
 - (NSDictionary *)sanitizeUIElement:(NSDictionary *)element debug:(BOOL)debug;
@@ -748,6 +767,10 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                               requestLogId:requestLogId];
     } else if ([basePath isEqualToString:@"/upload_file"]) {
         [self sendMethodNotAllowedResponse:clientSocket allowedMethods:@"POST" message:@"Method Not Allowed" requestLogId:requestLogId];
+    } else if ([method isEqualToString:@"GET"] && [basePath isEqualToString:@"/download_file"]) {
+        [self handleDownloadFileRequestPath:path clientSocket:clientSocket requestLogId:requestLogId];
+    } else if ([basePath isEqualToString:@"/download_file"]) {
+        [self sendMethodNotAllowedResponse:clientSocket allowedMethods:@"GET" message:@"Method Not Allowed" requestLogId:requestLogId];
     } else if ([method isEqualToString:@"GET"] && [basePath isEqualToString:@"/health"]) {
         NSDictionary *health = @{@"status": @"ok", @"server": MCP_SERVER_NAME, @"version": MCP_SERVER_VERSION};
         [self sendJSONResponse:clientSocket status:200 body:health requestLogId:nil];
@@ -981,6 +1004,89 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         @"size": @(bytesWritten)
     };
     [self sendJSONResponse:clientSocket status:200 body:body requestLogId:requestLogId];
+}
+
+// Extract and percent-decode the "path" query parameter from a request target.
+static NSString *MCPQueryParameter(NSString *requestTarget, NSString *key) {
+    NSRange q = [requestTarget rangeOfString:@"?"];
+    if (q.location == NSNotFound) return nil;
+    NSString *query = [requestTarget substringFromIndex:q.location + 1];
+    for (NSString *pair in [query componentsSeparatedByString:@"&"]) {
+        NSRange eq = [pair rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+        NSString *name = [pair substringToIndex:eq.location];
+        if (![name isEqualToString:key]) continue;
+        NSString *value = [pair substringFromIndex:eq.location + 1];
+        value = [value stringByReplacingOccurrencesOfString:@"+" withString:@" "];
+        return [value stringByRemovingPercentEncoding] ?: value;
+    }
+    return nil;
+}
+
+- (void)handleDownloadFileRequestPath:(NSString *)path
+                         clientSocket:(int)clientSocket
+                         requestLogId:(NSString *)requestLogId {
+    // Honor the lock guard: do not serve device files while locked or screen off.
+    NSDictionary *deviceState = [[ScreenManager sharedInstance] deviceInteractionState];
+    if (MCPDeviceStateRequiresWakeOrUnlock(deviceState)) {
+        [self sendErrorResponse:clientSocket status:403 message:@"Device is locked or screen is off; wake the device before downloading files" requestLogId:requestLogId];
+        return;
+    }
+
+    NSString *filePath = MCPQueryParameter(path, @"path");
+    if (filePath.length == 0) {
+        [self sendErrorResponse:clientSocket status:400 message:@"Missing required query parameter: path" requestLogId:requestLogId];
+        return;
+    }
+
+    BOOL isTemporary = NO;
+    NSString *resolveError = nil;
+    NSString *diskPath = [[FileSystemManager sharedInstance] resolveDownloadPath:filePath
+                                                                     isTemporary:&isTemporary
+                                                                           error:&resolveError];
+    if (!diskPath) {
+        [self sendErrorResponse:clientSocket status:404 message:(resolveError ?: @"File not found") requestLogId:requestLogId];
+        return;
+    }
+
+    int fd = open(diskPath.fileSystemRepresentation, O_RDONLY);
+    if (fd < 0) {
+        if (isTemporary) [[NSFileManager defaultManager] removeItemAtPath:diskPath error:nil];
+        [self sendErrorResponse:clientSocket status:500 message:[NSString stringWithFormat:@"Failed to open file: %s", strerror(errno)] requestLogId:requestLogId];
+        return;
+    }
+
+    struct stat st;
+    long long fileSize = 0;
+    if (fstat(fd, &st) == 0) fileSize = st.st_size;
+
+    NSString *downloadName = filePath.lastPathComponent ?: @"file";
+    NSString *header = [NSString stringWithFormat:
+        @"HTTP/1.1 200 OK\r\n"
+        @"Content-Type: application/octet-stream\r\n"
+        @"Content-Length: %lld\r\n"
+        @"Content-Disposition: attachment; filename=\"%@\"\r\n"
+        @"Connection: close\r\n"
+        @"\r\n",
+        fileSize, downloadName];
+    [self writeAll:clientSocket data:[header dataUsingEncoding:NSUTF8StringEncoding] requestLogId:requestLogId];
+
+    long long sent = 0;
+    char *chunk = malloc(MCP_UPLOAD_CHUNK);
+    if (chunk) {
+        ssize_t n;
+        while ((n = read(fd, chunk, MCP_UPLOAD_CHUNK)) > 0) {
+            NSData *data = [NSData dataWithBytesNoCopy:chunk length:(NSUInteger)n freeWhenDone:NO];
+            [self writeAll:clientSocket data:data requestLogId:nil];
+            sent += n;
+        }
+        free(chunk);
+    }
+    close(fd);
+    if (isTemporary) [[NSFileManager defaultManager] removeItemAtPath:diskPath error:nil];
+
+    [MCPLogger log:@"file_download req=%@ sock=%d ok=yes bytes=%lld privilegedTemp=%@",
+     requestLogId ?: @"-", clientSocket, sent, isTemporary ? @"yes" : @"no"];
 }
 
 static NSString *MCPRedactedLogText(NSString *s) {
@@ -1217,7 +1323,7 @@ static NSString *MCPLogId(id reqId) {
                 @"name": MCP_SERVER_NAME,
                 @"version": MCP_SERVER_VERSION
             },
-            @"instructions": @"Use ios-mcp to inspect and operate the connected iPhone.\n\nGetting started: call get_frontmost_app, get_screen_info, get_ui_elements, and screenshot to understand the current device state. get_screen_info includes device_state when SpringBoard exposes it. If locked is true, screen_on is false, the screenshot looks like the Lock Screen, or UI elements are from SpringBoard/Lock Screen, do not continue normal app automation until the device is awake/unlocked.\n\nLock screen handling: a single press_home only wakes or advances the Lock Screen and must not be treated as reaching the Home screen. Use wake_and_home when the device may be locked/off. The equivalent manual sequence is Power then Home when the screen is off, or Home twice when the Lock Screen is already visible. After wake_and_home, verify with screenshot/get_ui_elements/get_frontmost_app before continuing. The server enforces a lock guard: while locked or screen_off, interactive and mutating tools are blocked; only observation and recovery tools are allowed.\n\nTouch and gestures: use screen point coordinates for tap_screen, swipe_screen, long_press, double_tap, and drag_and_drop. For Flutter or custom-rendered apps, accessibility may expose only a container such as FlutterView; use screenshot plus coordinates in that case.\n\nText input: use input_text first for fast bulk text through system keyboard events. If input_text returns isError or reports failure/timeout, immediately retry the same text with type_text; do not repeat input_text. Use type_text for character-by-character input and press_key for special keys (enter, delete, tab, etc.).\n\nHardware buttons: press_home, press_power, press_volume_up, press_volume_down, toggle_mute, wake_and_home.\n\nClipboard: get_clipboard and set_clipboard to read/write clipboard contents.\n\nScreenshot: the screenshot tool returns MCP image content, not text — result.content[0].data contains the base64 JPEG payload and result.content[0].mimeType is usually image/jpeg.\n\nApp management: launch_app, kill_app, list_apps, list_running_apps, get_frontmost_app. launch_app waits until the target app is actually frontmost before returning, so do not immediately re-issue redundant foreground checks unless you need to verify a later transition. To install an app from the computer, first upload raw IPA bytes to POST /upload_file (for example: curl -H 'X-Filename: app.ipa' --data-binary @app.ipa http://device-ip:8090/upload_file). The upload response returns a device path; pass that path to install_app. To install an IPA already on the phone, call install_app directly with its device path. Unsigned or fakesigned IPAs are supported. To uninstall: use list_apps to find the bundle_id, then call uninstall_app.\n\nDevice control: get_brightness/set_brightness, get_volume/set_volume, open_url (supports http/https and URL schemes like tel://, prefs:root=WIFI, etc.).\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information. Pass debug=true only when diagnosing installation integrity to include bundled helper executable status.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; ios-mcp commands often run under /bin/sh where that may execute only once. Use seq or a while loop, and use at least --connect-timeout 3 plus --max-time 5 for /health.\n\nShell: run_command to execute shell commands on the device (timeout default 10s, max 30s)."
+            @"instructions": @"Use ios-mcp to inspect and operate the connected iPhone.\n\nGetting started: call get_frontmost_app, get_screen_info, get_ui_elements, and screenshot to understand the current device state. get_screen_info includes device_state when SpringBoard exposes it. If locked is true, screen_on is false, the screenshot looks like the Lock Screen, or UI elements are from SpringBoard/Lock Screen, do not continue normal app automation until the device is awake/unlocked.\n\nLock screen handling: a single press_home only wakes or advances the Lock Screen and must not be treated as reaching the Home screen. Use wake_and_home when the device may be locked/off. The equivalent manual sequence is Power then Home when the screen is off, or Home twice when the Lock Screen is already visible. After wake_and_home, verify with screenshot/get_ui_elements/get_frontmost_app before continuing. The server enforces a lock guard: while locked or screen_off, interactive and mutating tools are blocked; only observation and recovery tools are allowed.\n\nTouch and gestures: use screen point coordinates for tap_screen, swipe_screen, long_press, double_tap, and drag_and_drop. For Flutter or custom-rendered apps, accessibility may expose only a container such as FlutterView; use screenshot plus coordinates in that case.\n\nText input: use input_text first for fast bulk text through system keyboard events. If input_text returns isError or reports failure/timeout, immediately retry the same text with type_text; do not repeat input_text. Use type_text for character-by-character input and press_key for special keys (enter, delete, tab, etc.).\n\nHardware buttons: press_home, press_power, press_volume_up, press_volume_down, toggle_mute, wake_and_home.\n\nClipboard: get_clipboard and set_clipboard to read/write clipboard contents.\n\nScreenshot: the screenshot tool returns MCP image content, not text — result.content[0].data contains the base64 JPEG payload and result.content[0].mimeType is usually image/jpeg.\n\nApp management: launch_app, kill_app, list_apps, list_running_apps, get_frontmost_app. launch_app waits until the target app is actually frontmost before returning, so do not immediately re-issue redundant foreground checks unless you need to verify a later transition. To install an app from the computer, first upload raw IPA bytes to POST /upload_file (for example: curl -H 'X-Filename: app.ipa' --data-binary @app.ipa http://device-ip:8090/upload_file). The upload response returns a device path; pass that path to install_app. To install an IPA already on the phone, call install_app directly with its device path. Unsigned or fakesigned IPAs are supported. To uninstall: use list_apps to find the bundle_id, then call uninstall_app.\n\nDevice control: get_brightness/set_brightness, get_volume/set_volume, open_url (supports http/https and URL schemes like tel://, prefs:root=WIFI, etc.).\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information. Pass debug=true only when diagnosing installation integrity to include bundled helper executable status.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; ios-mcp commands often run under /bin/sh where that may execute only once. Use seq or a while loop, and use at least --connect-timeout 3 plus --max-time 5 for /health.\n\nShell: run_command to execute shell commands on the device (timeout default 10s, max 30s).\n\nReverse engineering and debugging: get_app_info returns an installed app's bundle path, data container (sandbox) path, App Group container paths, executable path, version, and entitlements — call it first to locate files. list_dir, read_file, and write_file operate on the device filesystem and fall back to the privileged mcp-root helper for protected paths (other apps' sandboxes, system dirs). read_file returns utf8 for text and base64 for binary; it is capped (default 512KB), so for large or binary files use GET /download_file?path=<device-path> to stream the full file (for example: curl 'http://device-ip:8090/download_file?path=/var/mobile/...' -o out.bin). get_syslog captures the live unified system log across all processes (the stream Console.app shows) for a few seconds — it is a live capture, so trigger the activity you want to observe during the window. get_crash_logs lists crash reports (filter by bundle_id), and read_crash_log returns a single report's full text. write_file is blocked while the device is locked or the screen is off."
         }
     };
 }
@@ -1595,6 +1701,90 @@ static NSString *MCPLogId(id reqId) {
                 },
                 @"required": @[@"bundle_id"]
             }
+        },
+        // ---- Reverse-engineering: app info, filesystem, logs ----
+        @{
+            @"name": @"get_app_info",
+            @"description": @"Get detailed info for an installed app: bundle (.app) path, data container (sandbox) path, App Group shared container paths, main executable path, version, SDK/minimum OS version, and code-signing entitlements. Use this to locate an app's files before read_file/list_dir. Use list_apps to find the bundle_id first.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"App bundle identifier (e.g. com.example.app)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"list_dir",
+            @"description": @"List the contents of a directory on the device filesystem. Returns each entry's name, type (file/directory/symlink/...), size, permission bits, and modification time. Falls back to the privileged mcp-root helper for paths the server cannot read directly (other apps' sandbox containers, system directories). Combine with get_app_info to explore an app's data container.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute directory path on device (e.g. /var/mobile/Containers/Data/Application/<UUID> or /var/mobile)."}
+                },
+                @"required": @[@"path"]
+            }
+        },
+        @{
+            @"name": @"read_file",
+            @"description": @"Read a file from the device filesystem. Text files return encoding 'utf8'; binary files (plist/db/images/dumps) return encoding 'base64'. Output is capped (default 512KB, max 4MB); when truncated, use GET /download_file?path=<path> to stream the full file. Falls back to the privileged mcp-root helper for protected paths.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute file path on device."},
+                    @"max_bytes": @{@"type": @"number", @"description": @"Optional max bytes to read (default 524288, max 4194304)."},
+                    @"binary": @{@"type": @"boolean", @"description": @"Optional. Force base64 output even if the content looks like text. Default false."}
+                },
+                @"required": @[@"path"]
+            }
+        },
+        @{
+            @"name": @"write_file",
+            @"description": @"Write a file to the device filesystem, creating or overwriting it. content is interpreted per encoding: 'utf8' (default) or 'base64' for binary data. Falls back to the privileged mcp-root helper for protected paths. This is a mutating tool and is blocked while the device is locked or the screen is off.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute destination file path on device."},
+                    @"content": @{@"type": @"string", @"description": @"File content. Plain text for utf8, or a base64 string when encoding is base64."},
+                    @"encoding": @{@"type": @"string", @"description": @"Content encoding: 'utf8' (default) or 'base64'."}
+                },
+                @"required": @[@"path", @"content"]
+            }
+        },
+        @{
+            @"name": @"get_syslog",
+            @"description": @"Capture the live unified system log across ALL processes (the same stream Console.app shows), via the bundled mcp-logreader helper connected to diagnosticd. This is a LIVE capture: it collects log events arriving during a time window (last_seconds), not historical logs — trigger the activity you want to observe during the window. Optionally filter by process name and severity. Returns structured entries (process, pid, subsystem, category, level, message, date).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"process": @{@"type": @"string", @"description": @"Optional process name substring to filter by (e.g. an app's executable name like 'WeChat', or a daemon like 'locationd')."},
+                    @"level": @{@"type": @"string", @"description": @"Optional severity filter: 'error' or 'fault'. Omit or 'all' for all levels."},
+                    @"last_seconds": @{@"type": @"number", @"description": @"Live capture window in seconds (default 5, max 60). Events are collected for this duration before returning."},
+                    @"max_lines": @{@"type": @"number", @"description": @"Max entries to return (default 500, max 5000)."}
+                }
+            }
+        },
+        @{
+            @"name": @"get_crash_logs",
+            @"description": @"List crash reports (.ips/.crash) from the device's CrashReporter directories, newest first. Optionally filter by bundle id or process name prefix. Returns each report's name, path, size, and date; pass a path to read_crash_log for the full report.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional bundle id / process name prefix to filter crash reports (e.g. com.example.app or the executable name)."},
+                    @"limit": @{@"type": @"number", @"description": @"Max number of reports to return (default 30)."}
+                }
+            }
+        },
+        @{
+            @"name": @"read_crash_log",
+            @"description": @"Read the full text of a single crash report by its path (obtained from get_crash_logs).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute path to the crash report file, from get_crash_logs."}
+                },
+                @"required": @[@"path"]
+            }
         }
     ];
 
@@ -1729,6 +1919,22 @@ static NSString *MCPLogId(id reqId) {
         return [self executeInstallApp:reqId args:args];
     } else if ([toolName isEqualToString:@"uninstall_app"]) {
         return [self executeUninstallApp:reqId args:args];
+    }
+    // Reverse-engineering tools
+    else if ([toolName isEqualToString:@"get_app_info"]) {
+        return [self executeGetAppInfo:reqId args:args];
+    } else if ([toolName isEqualToString:@"list_dir"]) {
+        return [self executeListDir:reqId args:args];
+    } else if ([toolName isEqualToString:@"read_file"]) {
+        return [self executeReadFile:reqId args:args];
+    } else if ([toolName isEqualToString:@"write_file"]) {
+        return [self executeWriteFile:reqId args:args];
+    } else if ([toolName isEqualToString:@"get_syslog"]) {
+        return [self executeGetSyslog:reqId args:args];
+    } else if ([toolName isEqualToString:@"get_crash_logs"]) {
+        return [self executeGetCrashLogs:reqId args:args];
+    } else if ([toolName isEqualToString:@"read_crash_log"]) {
+        return [self executeReadCrashLog:reqId args:args];
     }
     return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown tool: %@", toolName]];
 }
@@ -3059,6 +3265,152 @@ static BOOL MCPSetSystemBrightness(CGFloat brightness) {
         return [self mcpSuccess:reqId text:[NSString stringWithFormat:@"Uninstalled %@", bundleId]];
     }
     return [self mcpSuccess:reqId text:[NSString stringWithFormat:@"Uninstall failed: %@", err ?: @"unknown"] isError:YES];
+}
+
+#pragma mark - Reverse-engineering Tool Execution
+
+// Serialize a dictionary result into pretty JSON text for the MCP text payload.
+- (NSString *)jsonTextForDictionary:(NSDictionary *)dict {
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:dict
+                                                       options:NSJSONWritingPrettyPrinted
+                                                         error:nil];
+    NSString *text = jsonData ? [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding] : nil;
+    return text ?: @"{}";
+}
+
+- (NSDictionary *)executeGetAppInfo:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *bundleId = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    NSString *err = nil;
+    NSDictionary *info = [[AppManager sharedInstance] appInfoForBundleId:bundleId error:&err];
+    if (!info) {
+        return [self mcpSuccess:reqId text:(err ?: @"Failed to read app info") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:info]];
+}
+
+- (NSDictionary *)executeListDir:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *path = nil;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    NSString *err = nil;
+    NSDictionary *result = [[FileSystemManager sharedInstance] listDirectoryAtPath:path error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"Failed to list directory") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+}
+
+- (NSDictionary *)executeReadFile:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *path = nil;
+    double maxBytes = 0;
+    BOOL binary = NO;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError) ||
+        !MCPNumberFromArgs(args, @"max_bytes", 0, NO, &maxBytes, &paramError) ||
+        !MCPBoolFromArgs(args, @"binary", NO, &binary, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (maxBytes < 0) maxBytes = 0;
+
+    NSString *err = nil;
+    NSDictionary *result = [[FileSystemManager sharedInstance] readFileAtPath:path
+                                                                     maxBytes:(NSUInteger)maxBytes
+                                                                  forceBinary:binary
+                                                                        error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"Failed to read file") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+}
+
+- (NSDictionary *)executeWriteFile:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *path = nil;
+    NSString *content = nil;
+    NSString *encoding = nil;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError) ||
+        !MCPStringFromArgs(args, @"content", YES, &content, &paramError) ||
+        !MCPStringFromArgs(args, @"encoding", NO, &encoding, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (encoding.length == 0) encoding = @"utf8";
+
+    NSString *err = nil;
+    NSDictionary *result = [[FileSystemManager sharedInstance] writeFileAtPath:path
+                                                                       content:content
+                                                                      encoding:encoding
+                                                                         error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"Failed to write file") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+}
+
+- (NSDictionary *)executeGetSyslog:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *process = nil;
+    NSString *level = nil;
+    double lastSeconds = 60;
+    double maxLines = 0;
+    if (!MCPStringFromArgs(args, @"process", NO, &process, &paramError) ||
+        !MCPStringFromArgs(args, @"level", NO, &level, &paramError) ||
+        !MCPNumberFromArgs(args, @"last_seconds", 60, NO, &lastSeconds, &paramError) ||
+        !MCPNumberFromArgs(args, @"max_lines", 0, NO, &maxLines, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    NSString *err = nil;
+    NSDictionary *result = [[LogManager sharedInstance] syslogWithProcess:process
+                                                                    level:level
+                                                              lastSeconds:(NSInteger)lastSeconds
+                                                                 maxLines:(NSInteger)maxLines
+                                                                    error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"Failed to query system log") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+}
+
+- (NSDictionary *)executeGetCrashLogs:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *bundleId = nil;
+    double limit = 0;
+    if (!MCPStringFromArgs(args, @"bundle_id", NO, &bundleId, &paramError) ||
+        !MCPNumberFromArgs(args, @"limit", 0, NO, &limit, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    NSString *err = nil;
+    NSDictionary *result = [[LogManager sharedInstance] crashLogsForBundleId:bundleId
+                                                                       limit:(NSInteger)limit
+                                                                       error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"Failed to list crash logs") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+}
+
+- (NSDictionary *)executeReadCrashLog:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *path = nil;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    NSString *err = nil;
+    NSDictionary *result = [[LogManager sharedInstance] crashLogContentAtPath:path error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"Failed to read crash log") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
 }
 
 #pragma mark - Response Builders

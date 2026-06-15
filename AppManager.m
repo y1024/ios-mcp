@@ -1715,6 +1715,142 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
     return installed;
 }
 
+- (NSDictionary *)appInfoForBundleId:(NSString *)bundleId error:(NSString **)error {
+    if (error) *error = nil;
+    if (bundleId.length == 0) {
+        if (error) *error = @"bundle_id is required";
+        return nil;
+    }
+
+    __block NSDictionary *result = nil;
+    __block NSString *failure = nil;
+
+    dispatch_block_t block = ^{
+        Class LSWorkspaceClass = objc_getClass("LSApplicationWorkspace");
+        if (!LSWorkspaceClass) {
+            failure = @"LSApplicationWorkspace unavailable";
+            return;
+        }
+        id workspace = [LSWorkspaceClass performSelector:@selector(defaultWorkspace)];
+
+        id proxy = nil;
+        SEL proxySel = @selector(applicationProxyForIdentifier:);
+        if ([workspace respondsToSelector:proxySel]) {
+            proxy = MCPAppMsgSendObjectArg(workspace, proxySel, bundleId);
+        }
+        if (!proxy) {
+            // Fallback scan in case applicationProxyForIdentifier: returns a placeholder.
+            SEL allAppsSel = @selector(allInstalledApplications);
+            if ([workspace respondsToSelector:allAppsSel]) {
+                NSArray *allApps = MCPAppMsgSendObject(workspace, allAppsSel);
+                for (id candidate in allApps) {
+                    if (![candidate respondsToSelector:@selector(applicationIdentifier)]) continue;
+                    NSString *appId = [candidate performSelector:@selector(applicationIdentifier)];
+                    if ([appId isEqualToString:bundleId]) { proxy = candidate; break; }
+                }
+            }
+        }
+        if (!proxy) {
+            failure = [NSString stringWithFormat:@"App not installed: %@", bundleId];
+            return;
+        }
+
+        NSMutableDictionary *info = [NSMutableDictionary dictionary];
+        info[@"bundle_id"] = bundleId;
+
+        if ([proxy respondsToSelector:@selector(localizedName)]) {
+            NSString *name = MCPAppMsgSendObject(proxy, @selector(localizedName));
+            if ([name isKindOfClass:[NSString class]]) info[@"name"] = name;
+        }
+
+        NSString *rawType = nil;
+        if ([proxy respondsToSelector:@selector(applicationType)]) {
+            rawType = MCPAppMsgSendObject(proxy, @selector(applicationType));
+        }
+        info[@"type"] = MCPNormalizedInstalledAppType(proxy, bundleId, rawType ?: @"");
+
+        // Bundle (.app) path.
+        NSString *bundlePath = nil;
+        if ([proxy respondsToSelector:@selector(bundleURL)]) {
+            id bundleURL = MCPAppMsgSendObject(proxy, @selector(bundleURL));
+            if ([bundleURL isKindOfClass:[NSURL class]]) {
+                bundlePath = [((NSURL *)bundleURL).path stringByStandardizingPath];
+            }
+        }
+        if (bundlePath.length) info[@"bundle_path"] = bundlePath;
+
+        // Data container (sandbox) path.
+        NSString *dataContainer = nil;
+        if ([proxy respondsToSelector:@selector(dataContainerURL)]) {
+            id dataURL = MCPAppMsgSendObject(proxy, @selector(dataContainerURL));
+            if ([dataURL isKindOfClass:[NSURL class]]) {
+                dataContainer = [((NSURL *)dataURL).path stringByStandardizingPath];
+            }
+        }
+        if (dataContainer.length) info[@"data_container"] = dataContainer;
+
+        // App Group / shared container paths.
+        if ([proxy respondsToSelector:@selector(groupContainerURLs)]) {
+            id groupURLs = MCPAppMsgSendObject(proxy, @selector(groupContainerURLs));
+            if ([groupURLs isKindOfClass:[NSDictionary class]]) {
+                NSMutableDictionary *groups = [NSMutableDictionary dictionary];
+                [(NSDictionary *)groupURLs enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+                    if ([key isKindOfClass:[NSString class]] && [obj isKindOfClass:[NSURL class]]) {
+                        groups[key] = [((NSURL *)obj).path stringByStandardizingPath];
+                    }
+                }];
+                if (groups.count) info[@"group_containers"] = groups;
+            }
+        }
+
+        // Version info from Info.plist.
+        NSString *executablePath = nil;
+        if (bundlePath.length) {
+            NSString *infoPlistPath = [bundlePath stringByAppendingPathComponent:@"Info.plist"];
+            NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+            if ([plist isKindOfClass:[NSDictionary class]]) {
+                if ([plist[@"CFBundleShortVersionString"] isKindOfClass:[NSString class]]) {
+                    info[@"short_version"] = plist[@"CFBundleShortVersionString"];
+                }
+                if ([plist[@"CFBundleVersion"] isKindOfClass:[NSString class]]) {
+                    info[@"version"] = plist[@"CFBundleVersion"];
+                }
+                if ([plist[@"DTPlatformVersion"] isKindOfClass:[NSString class]]) {
+                    info[@"sdk_version"] = plist[@"DTPlatformVersion"];
+                }
+                if ([plist[@"MinimumOSVersion"] isKindOfClass:[NSString class]]) {
+                    info[@"minimum_os_version"] = plist[@"MinimumOSVersion"];
+                }
+                NSString *executable = [plist[@"CFBundleExecutable"] isKindOfClass:[NSString class]] ? plist[@"CFBundleExecutable"] : nil;
+                if (executable.length) {
+                    executablePath = [bundlePath stringByAppendingPathComponent:executable];
+                    info[@"executable_path"] = executablePath;
+                }
+            }
+        }
+
+        // Entitlements from the main executable (reuses the fakesign code path's dumper).
+        if (executablePath.length) {
+            NSDictionary *entitlements = MCPDumpEntitlementsFromBinaryAtPath(executablePath);
+            if (entitlements.count) info[@"entitlements"] = entitlements;
+        }
+
+        result = [info copy];
+    };
+
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), block);
+    }
+
+    if (!result) {
+        if (error) *error = failure ?: @"Failed to read app info";
+        return nil;
+    }
+    return result;
+}
+
 - (BOOL)uninstallApp:(NSString *)bundleId error:(NSString **)error {
     if (!bundleId.length) {
         if (error) *error = @"Empty bundle ID";

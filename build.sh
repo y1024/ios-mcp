@@ -82,6 +82,7 @@ build_subprojects() {
   (cd mcp-roothelper && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-ldid && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-root && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
+  (cd mcp-logreader && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
 }
 
 build_selected_package() {
