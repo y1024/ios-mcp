@@ -329,6 +329,8 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"get_frontmost_app",
             @"get_ui_elements",
             @"get_element_at_point",
+            @"wait_for_element",
+            @"wait_for_disappear",
             @"list_apps",
             @"list_running_apps",
             @"get_device_info",
@@ -379,15 +381,11 @@ static BOOL MCPDeviceStateRequiresWakeOrUnlock(NSDictionary *state) {
     return NO;
 }
 
-static double MCPRandomUnit(void) {
-    return ((double)arc4random_uniform(1000000) / 1000000.0);
-}
-
 static double MCPRoundedScreenPoint(double value) {
     return round(value * 10.0) / 10.0;
 }
 
-static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
+static NSDictionary *MCPCenterTapPointForElement(NSDictionary *element) {
     if (![element isKindOfClass:[NSDictionary class]]) {
         return nil;
     }
@@ -407,31 +405,98 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         return tap;
     }
 
-    // 控制随机点击范围：只在 rect 中间区域随机
-    // 0.5 表示中间 50% 区域
-    // 例如 rect: x=0 y=0 width=80 height=40
-    // 最终随机区域: x=20 y=10 width=40 height=20
-    double centerRatio = 0.5;
-
-    double tapWidth = width * centerRatio;
-    double tapHeight = height * centerRatio;
-
-    double minX = x + (width - tapWidth) / 2.0;
-    double maxX = minX + tapWidth;
-
-    double minY = y + (height - tapHeight) / 2.0;
-    double maxY = minY + tapHeight;
-
-    double tapX = minX + ((maxX - minX) * MCPRandomUnit());
-    double tapY = minY + ((maxY - minY) * MCPRandomUnit());
-
-    tapX = MIN(MAX(tapX, x), x + width);
-    tapY = MIN(MAX(tapY, y), y + height);
+    // Tap the geometric center of the element's rect.
+    double tapX = x + width / 2.0;
+    double tapY = y + height / 2.0;
 
     return @{
         @"x": @(MCPRoundedScreenPoint(tapX)),
         @"y": @(MCPRoundedScreenPoint(tapY))
     };
+}
+
+#pragma mark - Element Matching (tap_element / wait_for_*)
+
+// Collect the candidate text strings for an element: primary "text" plus any "aliases".
+static NSArray<NSString *> *MCPElementTexts(NSDictionary *element) {
+    NSMutableArray<NSString *> *texts = [NSMutableArray array];
+    NSString *primary = [element[@"text"] isKindOfClass:[NSString class]] ? element[@"text"] : nil;
+    if (primary.length > 0) [texts addObject:primary];
+    NSArray *aliases = [element[@"aliases"] isKindOfClass:[NSArray class]] ? element[@"aliases"] : nil;
+    for (id a in aliases) {
+        if ([a isKindOfClass:[NSString class]] && [(NSString *)a length] > 0) [texts addObject:a];
+    }
+    return texts;
+}
+
+// Does a single element satisfy the match criteria?
+//   text:     substring (contains) or exact text match against text/aliases (nil = any)
+//   exact:    YES for exact match, NO for case-insensitive contains
+//   type:     "control"/"element" filter (nil = any)
+//   clickableOnly: require clickable == YES
+//   visibleOnly:   require an on-screen visible_rect
+static BOOL MCPElementMatches(NSDictionary *element,
+                              NSString *text,
+                              BOOL exact,
+                              NSString *type,
+                              BOOL clickableOnly,
+                              BOOL visibleOnly) {
+    if (![element isKindOfClass:[NSDictionary class]]) return NO;
+
+    if (clickableOnly) {
+        id c = element[@"clickable"];
+        if (![c respondsToSelector:@selector(boolValue)] || ![c boolValue]) return NO;
+    }
+    if (type.length > 0) {
+        NSString *t = [element[@"type"] isKindOfClass:[NSString class]] ? element[@"type"] : nil;
+        if (![t isEqualToString:type]) return NO;
+    }
+    if (visibleOnly) {
+        if (![element[@"visible_rect"] isKindOfClass:[NSDictionary class]]) return NO;
+    }
+    if (text.length > 0) {
+        BOOL hit = NO;
+        for (NSString *candidate in MCPElementTexts(element)) {
+            if (exact) {
+                if ([candidate isEqualToString:text]) { hit = YES; break; }
+            } else {
+                if ([candidate rangeOfString:text options:NSCaseInsensitiveSearch].location != NSNotFound) { hit = YES; break; }
+            }
+        }
+        if (!hit) return NO;
+    }
+    return YES;
+}
+
+// Filter a payload's "elements" array by criteria, returning the matches in order.
+static NSArray<NSDictionary *> *MCPMatchingElements(NSDictionary *payload,
+                                                    NSString *text,
+                                                    BOOL exact,
+                                                    NSString *type,
+                                                    BOOL clickableOnly,
+                                                    BOOL visibleOnly) {
+    NSArray *elements = [payload[@"elements"] isKindOfClass:[NSArray class]] ? payload[@"elements"] : nil;
+    if (!elements) return @[];
+    NSMutableArray<NSDictionary *> *matches = [NSMutableArray array];
+    for (id item in elements) {
+        if ([item isKindOfClass:[NSDictionary class]] &&
+            MCPElementMatches(item, text, exact, type, clickableOnly, visibleOnly)) {
+            [matches addObject:item];
+        }
+    }
+    return matches;
+}
+
+// Compact summary of an element for tool responses (no internal AX noise).
+static NSDictionary *MCPElementSummary(NSDictionary *element) {
+    NSMutableDictionary *s = [NSMutableDictionary dictionary];
+    if ([element[@"text"] isKindOfClass:[NSString class]]) s[@"text"] = element[@"text"];
+    if ([element[@"type"] isKindOfClass:[NSString class]]) s[@"type"] = element[@"type"];
+    if (element[@"clickable"]) s[@"clickable"] = element[@"clickable"];
+    NSDictionary *rect = [element[@"visible_rect"] isKindOfClass:[NSDictionary class]] ? element[@"visible_rect"]
+                       : ([element[@"rect"] isKindOfClass:[NSDictionary class]] ? element[@"rect"] : nil);
+    if (rect) s[@"rect"] = rect;
+    return s;
 }
 
 
@@ -467,6 +532,8 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 - (BOOL)pressButtonSynchronously:(HIDButtonType)button duration:(NSTimeInterval)duration timeout:(NSTimeInterval)timeout error:(NSString **)error;
 - (NSDictionary *)executeWakeAndHome:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeTap:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeTapElement:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeWaitForElement:(id)reqId args:(NSDictionary *)args waitForAppear:(BOOL)waitForAppear;
 - (NSDictionary *)executeSwipe:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeScreenInfo:(id)reqId;
 - (NSDictionary *)executeScreenshot:(id)reqId args:(NSDictionary *)args;
@@ -1407,6 +1474,50 @@ static NSString *MCPLogId(id reqId) {
             }
         },
         @{
+            @"name": @"tap_element",
+            @"description": @"Find a UI element by its text/accessibility label and tap it, instead of computing raw coordinates yourself. Matches against an element's accessibility text (label/title/identifier/value). Prefer this over tap_screen for reliable, layout-independent tapping. Returns tapped=true with the matched element, or tapped=false with a reason when no element matches.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"text": @{@"type": @"string", @"description": @"Text/label to match (case-insensitive substring by default). e.g. 'Sign In', '设置'."},
+                    @"identifier": @{@"type": @"string", @"description": @"Exact accessibility identifier/label to match (takes precedence over text, exact match)."},
+                    @"role": @{@"type": @"string", @"description": @"Optional element type filter: 'control' (interactive/labeled) or 'element'."},
+                    @"match": @{@"type": @"string", @"description": @"Text match mode: 'contains' (default) or 'exact'."},
+                    @"index": @{@"type": @"integer", @"description": @"When multiple elements match, which one to tap (0-based, default 0)."}
+                }
+            }
+        },
+        @{
+            @"name": @"wait_for_element",
+            @"description": @"Poll the UI until an element matching the given text/label/role appears (or until timeout). Use this to synchronize automation after an action that triggers a screen transition or async load, instead of sleeping or repeatedly calling get_ui_elements. Returns found=true with waited_ms once it appears, or found=false on timeout.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"text": @{@"type": @"string", @"description": @"Text/label to wait for (case-insensitive substring by default)."},
+                    @"identifier": @{@"type": @"string", @"description": @"Exact accessibility identifier/label to wait for (exact match)."},
+                    @"role": @{@"type": @"string", @"description": @"Optional element type filter: 'control' or 'element'."},
+                    @"match": @{@"type": @"string", @"description": @"Text match mode: 'contains' (default) or 'exact'."},
+                    @"timeout_ms": @{@"type": @"number", @"description": @"Max time to wait in milliseconds (default 5000, max 30000)."},
+                    @"interval_ms": @{@"type": @"number", @"description": @"Poll interval in milliseconds (default 500, min 100)."}
+                }
+            }
+        },
+        @{
+            @"name": @"wait_for_disappear",
+            @"description": @"Poll the UI until an element matching the given text/label/role is no longer present (or until timeout). Use this to wait for a loading spinner, overlay, or transition view to go away before continuing. Returns disappeared=true with waited_ms, or disappeared=false on timeout.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"text": @{@"type": @"string", @"description": @"Text/label that should disappear (case-insensitive substring by default)."},
+                    @"identifier": @{@"type": @"string", @"description": @"Exact accessibility identifier/label that should disappear (exact match)."},
+                    @"role": @{@"type": @"string", @"description": @"Optional element type filter: 'control' or 'element'."},
+                    @"match": @{@"type": @"string", @"description": @"Text match mode: 'contains' (default) or 'exact'."},
+                    @"timeout_ms": @{@"type": @"number", @"description": @"Max time to wait in milliseconds (default 5000, max 30000)."},
+                    @"interval_ms": @{@"type": @"number", @"description": @"Poll interval in milliseconds (default 500, min 100)."}
+                }
+            }
+        },
+        @{
             @"name": @"swipe_screen",
             @"description": @"Swipe from one point to another on screen",
             @"inputSchema": @{
@@ -1841,6 +1952,12 @@ static NSString *MCPLogId(id reqId) {
     // Touch tools
     else if ([toolName isEqualToString:@"tap_screen"]) {
         return [self executeTap:reqId args:args];
+    } else if ([toolName isEqualToString:@"tap_element"]) {
+        return [self executeTapElement:reqId args:args];
+    } else if ([toolName isEqualToString:@"wait_for_element"]) {
+        return [self executeWaitForElement:reqId args:args waitForAppear:YES];
+    } else if ([toolName isEqualToString:@"wait_for_disappear"]) {
+        return [self executeWaitForElement:reqId args:args waitForAppear:NO];
     } else if ([toolName isEqualToString:@"swipe_screen"]) {
         return [self executeSwipe:reqId args:args];
     }
@@ -2139,6 +2256,156 @@ static NSString *MCPLogId(id reqId) {
     return [self mcpSuccess:reqId text:[NSString stringWithFormat:@"Tap failed: %@", err ?: @"timeout"] isError:YES];
 }
 
+#pragma mark - Element-level automation (tap_element / wait_for_*)
+
+// Synchronously fetch the current compact UI elements payload (clickableOnly optional).
+- (NSDictionary *)fetchCompactElementsClickableOnly:(BOOL)clickableOnly {
+    __block NSDictionary *payload = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[AccessibilityManager sharedInstance] getCompactUIElementsWithMaxElements:0
+                                                                   visibleOnly:YES
+                                                                 clickableOnly:clickableOnly
+                                                                    completion:^(NSDictionary *result, NSString *error) {
+        payload = result;
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+    return payload;
+}
+
+// Parse the common element-matching args shared by the three tools.
+- (BOOL)parseElementMatchArgs:(NSDictionary *)args
+                         text:(NSString **)outText
+                        exact:(BOOL *)outExact
+                         type:(NSString **)outType
+                        index:(NSInteger *)outIndex
+                        error:(NSString **)outError {
+    NSString *text = nil, *identifier = nil, *role = nil, *match = nil;
+    double indexValue = 0;
+    if (!MCPStringFromArgs(args, @"text", NO, &text, outError) ||
+        !MCPStringFromArgs(args, @"identifier", NO, &identifier, outError) ||
+        !MCPStringFromArgs(args, @"role", NO, &role, outError) ||
+        !MCPStringFromArgs(args, @"match", NO, &match, outError) ||
+        !MCPNumberFromArgs(args, @"index", 0, NO, &indexValue, outError)) {
+        return NO;
+    }
+    // identifier is an alias for an exact text match; text + contains is the default.
+    BOOL exact = [match isEqualToString:@"exact"];
+    NSString *needle = text;
+    if (identifier.length > 0) { needle = identifier; exact = YES; }
+    *outText = needle;
+    *outExact = exact;
+    *outType = role; // "control" / "element"
+    *outIndex = (NSInteger)indexValue;
+    return YES;
+}
+
+- (NSDictionary *)executeTapElement:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil, *text = nil, *type = nil;
+    BOOL exact = NO;
+    NSInteger index = 0;
+    if (![self parseElementMatchArgs:args text:&text exact:&exact type:&type index:&index error:&paramError]) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (text.length == 0 && type.length == 0) {
+        return [self mcpError:reqId code:-32602 message:@"tap_element requires at least one of: text, identifier, role"];
+    }
+
+    NSDictionary *payload = [self fetchCompactElementsClickableOnly:NO];
+    NSArray<NSDictionary *> *matches = MCPMatchingElements(payload, text, exact, type, NO, YES);
+
+    if (matches.count == 0) {
+        NSDictionary *result = @{@"tapped": @NO, @"reason": @"no_match",
+                                 @"query": @{@"text": text ?: @"", @"role": type ?: @"", @"exact": @(exact)}};
+        return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result] isError:YES];
+    }
+    if (index < 0 || index >= (NSInteger)matches.count) {
+        NSDictionary *result = @{@"tapped": @NO, @"reason": @"index_out_of_range",
+                                 @"matched_count": @(matches.count), @"index": @(index)};
+        return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result] isError:YES];
+    }
+
+    NSDictionary *target = matches[(NSUInteger)index];
+    NSDictionary *tap = MCPCenterTapPointForElement(target);
+    double tapX = 0, tapY = 0;
+    if (![tap[@"x"] respondsToSelector:@selector(doubleValue)] || ![tap[@"y"] respondsToSelector:@selector(doubleValue)]) {
+        NSDictionary *result = @{@"tapped": @NO, @"reason": @"no_tap_point", @"element": MCPElementSummary(target)};
+        return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result] isError:YES];
+    }
+    tapX = [tap[@"x"] doubleValue];
+    tapY = [tap[@"y"] doubleValue];
+
+    __block BOOL ok = NO; __block NSString *err = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[IOSMCPHIDManager sharedInstance] tapAtPoint:CGPointMake(tapX, tapY) completion:^(BOOL success, NSString *error) {
+        ok = success; err = error; dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+
+    if (ok) {
+        NSDictionary *result = @{@"tapped": @YES, @"matched_count": @(matches.count),
+                                 @"index": @(index), @"point": @{@"x": @(tapX), @"y": @(tapY)},
+                                 @"element": MCPElementSummary(target)};
+        return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+    }
+    NSDictionary *result = @{@"tapped": @NO, @"reason": @"tap_failed", @"error": err ?: @"timeout",
+                             @"element": MCPElementSummary(target)};
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result] isError:YES];
+}
+
+- (NSDictionary *)executeWaitForElement:(id)reqId args:(NSDictionary *)args waitForAppear:(BOOL)waitForAppear {
+    NSString *paramError = nil, *text = nil, *type = nil;
+    BOOL exact = NO;
+    NSInteger index = 0;
+    double timeoutMs = 5000, intervalMs = 500;
+    if (![self parseElementMatchArgs:args text:&text exact:&exact type:&type index:&index error:&paramError] ||
+        !MCPNumberFromArgs(args, @"timeout_ms", 5000, NO, &timeoutMs, &paramError) ||
+        !MCPNumberFromArgs(args, @"interval_ms", 500, NO, &intervalMs, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (text.length == 0 && type.length == 0) {
+        return [self mcpError:reqId code:-32602 message:@"requires at least one of: text, identifier, role"];
+    }
+    if (timeoutMs <= 0) timeoutMs = 5000;
+    if (timeoutMs > 30000) timeoutMs = 30000;
+    if (intervalMs < 100) intervalMs = 100;
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeoutMs / 1000.0];
+    NSDate *start = [NSDate date];
+    NSDictionary *lastMatch = nil;
+
+    while (1) {
+        NSDictionary *payload = [self fetchCompactElementsClickableOnly:NO];
+        NSArray<NSDictionary *> *matches = MCPMatchingElements(payload, text, exact, type, NO, YES);
+        BOOL present = (matches.count > 0);
+        lastMatch = present ? matches.firstObject : nil;
+
+        BOOL conditionMet = waitForAppear ? present : !present;
+        if (conditionMet) {
+            NSInteger waited = (NSInteger)([[NSDate date] timeIntervalSinceDate:start] * 1000.0);
+            NSMutableDictionary *result = [NSMutableDictionary dictionary];
+            if (waitForAppear) {
+                result[@"found"] = @YES;
+                result[@"matched_count"] = @(matches.count);
+                if (lastMatch) result[@"element"] = MCPElementSummary(lastMatch);
+            } else {
+                result[@"disappeared"] = @YES;
+            }
+            result[@"waited_ms"] = @(waited);
+            return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+        }
+
+        if ([[NSDate date] compare:deadline] != NSOrderedAscending) break;
+        usleep((useconds_t)(intervalMs * 1000));
+    }
+
+    NSInteger waited = (NSInteger)([[NSDate date] timeIntervalSinceDate:start] * 1000.0);
+    NSDictionary *result = waitForAppear
+        ? @{@"found": @NO, @"waited_ms": @(waited)}
+        : @{@"disappeared": @NO, @"waited_ms": @(waited)};
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result] isError:YES];
+}
+
 - (NSDictionary *)executeSwipe:(id)reqId args:(NSDictionary *)args {
     NSString *paramError = nil;
     double fromX = 0;
@@ -2348,7 +2615,7 @@ static NSString *MCPLogId(id reqId) {
         @"rect",
         @"visible_rect"
     ]);
-    NSDictionary *tap = MCPRandomizedTapPointForElement(element);
+    NSDictionary *tap = MCPCenterTapPointForElement(element);
     if (tap.count > 0) {
         sanitized[@"tap"] = tap;
     }
