@@ -8,6 +8,7 @@
 #import "TextInputManager.h"
 #import "FileSystemManager.h"
 #import "LogManager.h"
+#import "OCRManager.h"
 #import "MCPLogger.h"
 #import <UIKit/UIKit.h>
 #import <sys/socket.h>
@@ -329,6 +330,8 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"get_frontmost_app",
             @"get_ui_elements",
             @"get_element_at_point",
+            @"ocr_screen",
+            @"describe_screen",
             @"wait_for_element",
             @"wait_for_disappear",
             @"list_apps",
@@ -546,6 +549,8 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
 - (NSDictionary *)executeGetFrontmostApp:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeGetUIElements:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeGetElementAtPoint:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeOCRScreen:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeDescribeScreen:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeInputText:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeTypeText:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executePressKey:(id)reqId args:(NSDictionary *)args;
@@ -1641,6 +1646,30 @@ static NSString *MCPLogId(id reqId) {
                 @"required": @[@"x", @"y"]
             }
         },
+        @{
+            @"name": @"ocr_screen",
+            @"description": @"Recognize text on the current screen via on-device OCR (Vision framework) and return each text block with screen-point coordinates. Use this when get_ui_elements/tap_element cannot see the content — games, Flutter/React Native/Unity apps, canvas-rendered UI, or text inside images. Each result includes a ready-to-use tap point. Pair with tap_screen to tap recognized text.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"languages": @{@"type": @"array", @"items": @{@"type": @"string"}, @"description": @"Recognition languages, e.g. ['zh-Hans','en-US']. Default ['zh-Hans','en-US']."},
+                    @"min_confidence": @{@"type": @"number", @"description": @"Drop results below this confidence 0..1 (default 0.3)."},
+                    @"region": @{@"type": @"object", @"description": @"Optional screen-point rect {x,y,width,height} to limit OCR to a region."}
+                }
+            }
+        },
+        @{
+            @"name": @"describe_screen",
+            @"description": @"Get a single structured snapshot of the current screen for agent decision-making: frontmost app, interactive elements (with tap points), optionally an OCR text layer for content the accessibility tree misses, and optionally a base64 screenshot. Prefer this as the one-call 'look at the screen' interface instead of calling get_frontmost_app + get_ui_elements + ocr_screen separately.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"include_screenshot": @{@"type": @"boolean", @"description": @"Include a base64 JPEG screenshot (default false, saves tokens)."},
+                    @"include_ocr": @{@"type": @"boolean", @"description": @"Add an OCR text layer for content not in the accessibility tree (default false)."},
+                    @"clickable_only": @{@"type": @"boolean", @"description": @"Only return clickable elements (default true)."}
+                }
+            }
+        },
         // ---- Text input tools ----
         @{
             @"name": @"input_text",
@@ -1990,6 +2019,10 @@ static NSString *MCPLogId(id reqId) {
         return [self executeGetUIElements:reqId args:args];
     } else if ([toolName isEqualToString:@"get_element_at_point"]) {
         return [self executeGetElementAtPoint:reqId args:args];
+    } else if ([toolName isEqualToString:@"ocr_screen"]) {
+        return [self executeOCRScreen:reqId args:args];
+    } else if ([toolName isEqualToString:@"describe_screen"]) {
+        return [self executeDescribeScreen:reqId args:args];
     }
     // Text input tools
     else if ([toolName isEqualToString:@"input_text"]) {
@@ -2920,6 +2953,106 @@ static NSString *MCPLogId(id reqId) {
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:responsePayload options:0 error:nil];
     NSString *jsonStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
     return [self mcpSuccess:reqId text:jsonStr isError:YES];
+}
+
+#pragma mark - OCR / Screen Description
+
+- (NSDictionary *)executeOCRScreen:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    double minConfidence = 0.3;
+    if (!MCPNumberFromArgs(args, @"min_confidence", 0.3, NO, &minConfidence, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (minConfidence < 0) minConfidence = 0;
+    if (minConfidence > 1) minConfidence = 1;
+
+    NSArray<NSString *> *languages = nil;
+    id langs = args[@"languages"];
+    if ([langs isKindOfClass:[NSArray class]]) {
+        NSMutableArray *valid = [NSMutableArray array];
+        for (id l in langs) { if ([l isKindOfClass:[NSString class]]) [valid addObject:l]; }
+        if (valid.count > 0) languages = valid;
+    }
+    NSDictionary *region = [args[@"region"] isKindOfClass:[NSDictionary class]] ? args[@"region"] : nil;
+
+    NSString *err = nil;
+    NSDictionary *result = [[OCRManager sharedInstance] recognizeTextWithLanguages:languages
+                                                                    minConfidence:minConfidence
+                                                                           region:region
+                                                                            error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"OCR failed") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+}
+
+- (NSDictionary *)executeDescribeScreen:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    BOOL includeScreenshot = NO, includeOCR = NO, clickableOnly = YES;
+    if (!MCPBoolFromArgs(args, @"include_screenshot", NO, &includeScreenshot, &paramError) ||
+        !MCPBoolFromArgs(args, @"include_ocr", NO, &includeOCR, &paramError) ||
+        !MCPBoolFromArgs(args, @"clickable_only", YES, &clickableOnly, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+
+    // Frontmost app
+    NSDictionary *frontmost = [[AccessibilityManager sharedInstance] frontmostApplicationInfo];
+    if ([frontmost isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *fm = [NSMutableDictionary dictionary];
+        if ([frontmost[@"bundleId"] isKindOfClass:[NSString class]]) fm[@"bundleId"] = frontmost[@"bundleId"];
+        if ([frontmost[@"name"] isKindOfClass:[NSString class]]) fm[@"name"] = frontmost[@"name"];
+        if (fm.count) out[@"frontmost"] = fm;
+    }
+
+    // Accessibility elements (reuse compact crawl)
+    __block NSDictionary *uiPayload = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[AccessibilityManager sharedInstance] getCompactUIElementsWithMaxElements:0
+                                                                   visibleOnly:YES
+                                                                 clickableOnly:clickableOnly
+                                                                    completion:^(NSDictionary *result, NSString *error) {
+        uiPayload = result;
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+
+    NSArray *elements = [uiPayload[@"elements"] isKindOfClass:[NSArray class]] ? uiPayload[@"elements"] : @[];
+    NSMutableArray *outElements = [NSMutableArray array];
+    for (id e in elements) {
+        if ([e isKindOfClass:[NSDictionary class]]) [outElements addObject:MCPElementSummary(e)];
+    }
+    out[@"elements"] = outElements;
+    out[@"element_count"] = @(outElements.count);
+    if ([uiPayload[@"screen"] isKindOfClass:[NSDictionary class]]) out[@"screen"] = uiPayload[@"screen"];
+    NSString *source = @"accessibility";
+
+    // Optional OCR layer
+    if (includeOCR) {
+        NSString *ocrErr = nil;
+        NSDictionary *ocr = [[OCRManager sharedInstance] recognizeTextWithLanguages:nil
+                                                                      minConfidence:0.3
+                                                                             region:nil
+                                                                              error:&ocrErr];
+        if ([ocr[@"texts"] isKindOfClass:[NSArray class]]) {
+            out[@"ocr_texts"] = ocr[@"texts"];
+            source = @"accessibility+ocr";
+            if (!out[@"screen"] && [ocr[@"screen"] isKindOfClass:[NSDictionary class]]) out[@"screen"] = ocr[@"screen"];
+        }
+    }
+
+    // Optional screenshot
+    if (includeScreenshot) {
+        NSDictionary *shot = [[ScreenManager sharedInstance] takeScreenshotPayload];
+        if ([shot[@"data"] isKindOfClass:[NSString class]]) {
+            out[@"screenshot"] = shot[@"data"];
+            out[@"screenshot_mime"] = shot[@"mimeType"] ?: @"image/jpeg";
+        }
+    }
+
+    out[@"source"] = source;
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:out]];
 }
 
 #pragma mark - Text Input Execution

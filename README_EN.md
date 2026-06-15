@@ -13,7 +13,7 @@ iOS MCP is an [MCP (Model Context Protocol)](https://modelcontextprotocol.io) se
 | **Text Input** | `input_text` `type_text` `press_key` | Pasteboard fast input / HID character-by-character / special keys |
 | **Screenshot** | `screenshot` `get_screen_info` | Base64 JPEG screenshot, screen dimensions & orientation |
 | **App Management** | `launch_app` `kill_app` `list_apps` `list_running_apps` `get_frontmost_app` `get_app_info` `install_app` `uninstall_app` | Launch/kill/install/uninstall apps, query app bundle/container paths and entitlements |
-| **Accessibility / Elements** | `get_ui_elements` `get_element_at_point` `tap_element` `wait_for_element` `wait_for_disappear` | UI element tree, element lookup by coordinates, tap elements by text/label, wait for elements to appear or disappear |
+| **Accessibility / Elements** | `get_ui_elements` `get_element_at_point` `tap_element` `wait_for_element` `wait_for_disappear` `ocr_screen` `describe_screen` | UI element tree, element lookup by coordinates, tap elements by text/label, wait for elements to appear/disappear, on-screen OCR text recognition with coordinates, aggregated screen snapshot |
 | **Clipboard** | `get_clipboard` `set_clipboard` | Read/write clipboard |
 | **Filesystem** | `list_dir` `read_file` `write_file` | Directory listing, file read/write (text and binary) |
 | **Logs** | `get_syslog` `get_crash_logs` `read_crash_log` | Live system-wide log of all apps, crash report listing and reading |
@@ -22,7 +22,7 @@ iOS MCP is an [MCP (Model Context Protocol)](https://modelcontextprotocol.io) se
 | **URL** | `open_url` | Open URLs or URL schemes |
 | **Shell** | `run_command` | Execute shell commands |
 
-**44** MCP tools covering the major iOS device automation and reverse-engineering scenarios.
+**46** MCP tools covering the major iOS device automation and reverse-engineering scenarios.
 
 ## Runtime Requirements
 
