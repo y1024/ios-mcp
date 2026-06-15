@@ -72,7 +72,7 @@ http://DEVICE_IP:8090/health
 3. If you get the following response, the service is running correctly:
 
 ```json
-{"status":"ok","server":"ios-mcp","version":"1.1.2"}
+{"status":"ok","server":"ios-mcp","version":"1.2.0"}
 ```
 
 ## Usage
