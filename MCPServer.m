@@ -6,6 +6,9 @@
 #import "AccessibilityManager.h"
 #import "MCPProcessUtil.h"
 #import "TextInputManager.h"
+#import "FileSystemManager.h"
+#import "LogManager.h"
+#import "OCRManager.h"
 #import "MCPLogger.h"
 #import <UIKit/UIKit.h>
 #import <sys/socket.h>
@@ -17,6 +20,7 @@
 #import <stdlib.h>
 #import <sys/utsname.h>
 #import <sys/statvfs.h>
+#import <sys/stat.h>
 #import <sys/wait.h>
 #import <mach/mach.h>
 #import <objc/runtime.h>
@@ -25,7 +29,7 @@
 
 #define MCP_PROTOCOL_VERSION @"2025-03-26"
 #define MCP_SERVER_NAME      @"ios-mcp"
-#define MCP_SERVER_VERSION   @"1.1.2"
+#define MCP_SERVER_VERSION   @"1.2.0"
 #define HTTP_BUF_SIZE        (256 * 1024)
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_UPLOAD_DIR       @"/tmp/ios-mcp-uploads"
@@ -326,12 +330,22 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"get_frontmost_app",
             @"get_ui_elements",
             @"get_element_at_point",
+            @"ocr_screen",
+            @"describe_screen",
+            @"wait_for_element",
+            @"wait_for_disappear",
             @"list_apps",
             @"list_running_apps",
             @"get_device_info",
             @"get_clipboard",
             @"get_brightness",
-            @"get_volume"
+            @"get_volume",
+            @"get_app_info",
+            @"list_dir",
+            @"read_file",
+            @"get_syslog",
+            @"get_crash_logs",
+            @"read_crash_log"
         ];
     });
     return tools;
@@ -370,15 +384,11 @@ static BOOL MCPDeviceStateRequiresWakeOrUnlock(NSDictionary *state) {
     return NO;
 }
 
-static double MCPRandomUnit(void) {
-    return ((double)arc4random_uniform(1000000) / 1000000.0);
-}
-
 static double MCPRoundedScreenPoint(double value) {
     return round(value * 10.0) / 10.0;
 }
 
-static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
+static NSDictionary *MCPCenterTapPointForElement(NSDictionary *element) {
     if (![element isKindOfClass:[NSDictionary class]]) {
         return nil;
     }
@@ -398,31 +408,98 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         return tap;
     }
 
-    // 控制随机点击范围：只在 rect 中间区域随机
-    // 0.5 表示中间 50% 区域
-    // 例如 rect: x=0 y=0 width=80 height=40
-    // 最终随机区域: x=20 y=10 width=40 height=20
-    double centerRatio = 0.5;
-
-    double tapWidth = width * centerRatio;
-    double tapHeight = height * centerRatio;
-
-    double minX = x + (width - tapWidth) / 2.0;
-    double maxX = minX + tapWidth;
-
-    double minY = y + (height - tapHeight) / 2.0;
-    double maxY = minY + tapHeight;
-
-    double tapX = minX + ((maxX - minX) * MCPRandomUnit());
-    double tapY = minY + ((maxY - minY) * MCPRandomUnit());
-
-    tapX = MIN(MAX(tapX, x), x + width);
-    tapY = MIN(MAX(tapY, y), y + height);
+    // Tap the geometric center of the element's rect.
+    double tapX = x + width / 2.0;
+    double tapY = y + height / 2.0;
 
     return @{
         @"x": @(MCPRoundedScreenPoint(tapX)),
         @"y": @(MCPRoundedScreenPoint(tapY))
     };
+}
+
+#pragma mark - Element Matching (tap_element / wait_for_*)
+
+// Collect the candidate text strings for an element: primary "text" plus any "aliases".
+static NSArray<NSString *> *MCPElementTexts(NSDictionary *element) {
+    NSMutableArray<NSString *> *texts = [NSMutableArray array];
+    NSString *primary = [element[@"text"] isKindOfClass:[NSString class]] ? element[@"text"] : nil;
+    if (primary.length > 0) [texts addObject:primary];
+    NSArray *aliases = [element[@"aliases"] isKindOfClass:[NSArray class]] ? element[@"aliases"] : nil;
+    for (id a in aliases) {
+        if ([a isKindOfClass:[NSString class]] && [(NSString *)a length] > 0) [texts addObject:a];
+    }
+    return texts;
+}
+
+// Does a single element satisfy the match criteria?
+//   text:     substring (contains) or exact text match against text/aliases (nil = any)
+//   exact:    YES for exact match, NO for case-insensitive contains
+//   type:     "control"/"element" filter (nil = any)
+//   clickableOnly: require clickable == YES
+//   visibleOnly:   require an on-screen visible_rect
+static BOOL MCPElementMatches(NSDictionary *element,
+                              NSString *text,
+                              BOOL exact,
+                              NSString *type,
+                              BOOL clickableOnly,
+                              BOOL visibleOnly) {
+    if (![element isKindOfClass:[NSDictionary class]]) return NO;
+
+    if (clickableOnly) {
+        id c = element[@"clickable"];
+        if (![c respondsToSelector:@selector(boolValue)] || ![c boolValue]) return NO;
+    }
+    if (type.length > 0) {
+        NSString *t = [element[@"type"] isKindOfClass:[NSString class]] ? element[@"type"] : nil;
+        if (![t isEqualToString:type]) return NO;
+    }
+    if (visibleOnly) {
+        if (![element[@"visible_rect"] isKindOfClass:[NSDictionary class]]) return NO;
+    }
+    if (text.length > 0) {
+        BOOL hit = NO;
+        for (NSString *candidate in MCPElementTexts(element)) {
+            if (exact) {
+                if ([candidate isEqualToString:text]) { hit = YES; break; }
+            } else {
+                if ([candidate rangeOfString:text options:NSCaseInsensitiveSearch].location != NSNotFound) { hit = YES; break; }
+            }
+        }
+        if (!hit) return NO;
+    }
+    return YES;
+}
+
+// Filter a payload's "elements" array by criteria, returning the matches in order.
+static NSArray<NSDictionary *> *MCPMatchingElements(NSDictionary *payload,
+                                                    NSString *text,
+                                                    BOOL exact,
+                                                    NSString *type,
+                                                    BOOL clickableOnly,
+                                                    BOOL visibleOnly) {
+    NSArray *elements = [payload[@"elements"] isKindOfClass:[NSArray class]] ? payload[@"elements"] : nil;
+    if (!elements) return @[];
+    NSMutableArray<NSDictionary *> *matches = [NSMutableArray array];
+    for (id item in elements) {
+        if ([item isKindOfClass:[NSDictionary class]] &&
+            MCPElementMatches(item, text, exact, type, clickableOnly, visibleOnly)) {
+            [matches addObject:item];
+        }
+    }
+    return matches;
+}
+
+// Compact summary of an element for tool responses (no internal AX noise).
+static NSDictionary *MCPElementSummary(NSDictionary *element) {
+    NSMutableDictionary *s = [NSMutableDictionary dictionary];
+    if ([element[@"text"] isKindOfClass:[NSString class]]) s[@"text"] = element[@"text"];
+    if ([element[@"type"] isKindOfClass:[NSString class]]) s[@"type"] = element[@"type"];
+    if (element[@"clickable"]) s[@"clickable"] = element[@"clickable"];
+    NSDictionary *rect = [element[@"visible_rect"] isKindOfClass:[NSDictionary class]] ? element[@"visible_rect"]
+                       : ([element[@"rect"] isKindOfClass:[NSDictionary class]] ? element[@"rect"] : nil);
+    if (rect) s[@"rect"] = rect;
+    return s;
 }
 
 
@@ -440,6 +517,9 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                    initialBodyLength:(ssize_t)initialBodyLength
                         clientSocket:(int)clientSocket
                          requestLogId:(NSString *)requestLogId;
+- (void)handleDownloadFileRequestPath:(NSString *)path
+                         clientSocket:(int)clientSocket
+                         requestLogId:(NSString *)requestLogId;
 - (NSData *)readChunkedMCPBodyFromSocket:(int)clientSocket
                              initialBody:(const char *)initialBody
                        initialBodyLength:(ssize_t)initialBodyLength
@@ -455,6 +535,8 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 - (BOOL)pressButtonSynchronously:(HIDButtonType)button duration:(NSTimeInterval)duration timeout:(NSTimeInterval)timeout error:(NSString **)error;
 - (NSDictionary *)executeWakeAndHome:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeTap:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeTapElement:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeWaitForElement:(id)reqId args:(NSDictionary *)args waitForAppear:(BOOL)waitForAppear;
 - (NSDictionary *)executeSwipe:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeScreenInfo:(id)reqId;
 - (NSDictionary *)executeScreenshot:(id)reqId args:(NSDictionary *)args;
@@ -467,6 +549,8 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 - (NSDictionary *)executeGetFrontmostApp:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeGetUIElements:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeGetElementAtPoint:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeOCRScreen:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeDescribeScreen:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeInputText:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeTypeText:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executePressKey:(id)reqId args:(NSDictionary *)args;
@@ -482,6 +566,13 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
 - (NSDictionary *)executeSetVolume:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeInstallApp:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeUninstallApp:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeGetAppInfo:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeListDir:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeReadFile:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeWriteFile:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeGetSyslog:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeGetCrashLogs:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeReadCrashLog:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)sanitizeFrontmostInfo:(NSDictionary *)info debug:(BOOL)debug;
 - (NSDictionary *)sanitizeUIElementsPayload:(NSDictionary *)payload debug:(BOOL)debug;
 - (NSDictionary *)sanitizeUIElement:(NSDictionary *)element debug:(BOOL)debug;
@@ -748,6 +839,10 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
                               requestLogId:requestLogId];
     } else if ([basePath isEqualToString:@"/upload_file"]) {
         [self sendMethodNotAllowedResponse:clientSocket allowedMethods:@"POST" message:@"Method Not Allowed" requestLogId:requestLogId];
+    } else if ([method isEqualToString:@"GET"] && [basePath isEqualToString:@"/download_file"]) {
+        [self handleDownloadFileRequestPath:path clientSocket:clientSocket requestLogId:requestLogId];
+    } else if ([basePath isEqualToString:@"/download_file"]) {
+        [self sendMethodNotAllowedResponse:clientSocket allowedMethods:@"GET" message:@"Method Not Allowed" requestLogId:requestLogId];
     } else if ([method isEqualToString:@"GET"] && [basePath isEqualToString:@"/health"]) {
         NSDictionary *health = @{@"status": @"ok", @"server": MCP_SERVER_NAME, @"version": MCP_SERVER_VERSION};
         [self sendJSONResponse:clientSocket status:200 body:health requestLogId:nil];
@@ -981,6 +1076,89 @@ static NSDictionary *MCPRandomizedTapPointForElement(NSDictionary *element) {
         @"size": @(bytesWritten)
     };
     [self sendJSONResponse:clientSocket status:200 body:body requestLogId:requestLogId];
+}
+
+// Extract and percent-decode the "path" query parameter from a request target.
+static NSString *MCPQueryParameter(NSString *requestTarget, NSString *key) {
+    NSRange q = [requestTarget rangeOfString:@"?"];
+    if (q.location == NSNotFound) return nil;
+    NSString *query = [requestTarget substringFromIndex:q.location + 1];
+    for (NSString *pair in [query componentsSeparatedByString:@"&"]) {
+        NSRange eq = [pair rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+        NSString *name = [pair substringToIndex:eq.location];
+        if (![name isEqualToString:key]) continue;
+        NSString *value = [pair substringFromIndex:eq.location + 1];
+        value = [value stringByReplacingOccurrencesOfString:@"+" withString:@" "];
+        return [value stringByRemovingPercentEncoding] ?: value;
+    }
+    return nil;
+}
+
+- (void)handleDownloadFileRequestPath:(NSString *)path
+                         clientSocket:(int)clientSocket
+                         requestLogId:(NSString *)requestLogId {
+    // Honor the lock guard: do not serve device files while locked or screen off.
+    NSDictionary *deviceState = [[ScreenManager sharedInstance] deviceInteractionState];
+    if (MCPDeviceStateRequiresWakeOrUnlock(deviceState)) {
+        [self sendErrorResponse:clientSocket status:403 message:@"Device is locked or screen is off; wake the device before downloading files" requestLogId:requestLogId];
+        return;
+    }
+
+    NSString *filePath = MCPQueryParameter(path, @"path");
+    if (filePath.length == 0) {
+        [self sendErrorResponse:clientSocket status:400 message:@"Missing required query parameter: path" requestLogId:requestLogId];
+        return;
+    }
+
+    BOOL isTemporary = NO;
+    NSString *resolveError = nil;
+    NSString *diskPath = [[FileSystemManager sharedInstance] resolveDownloadPath:filePath
+                                                                     isTemporary:&isTemporary
+                                                                           error:&resolveError];
+    if (!diskPath) {
+        [self sendErrorResponse:clientSocket status:404 message:(resolveError ?: @"File not found") requestLogId:requestLogId];
+        return;
+    }
+
+    int fd = open(diskPath.fileSystemRepresentation, O_RDONLY);
+    if (fd < 0) {
+        if (isTemporary) [[NSFileManager defaultManager] removeItemAtPath:diskPath error:nil];
+        [self sendErrorResponse:clientSocket status:500 message:[NSString stringWithFormat:@"Failed to open file: %s", strerror(errno)] requestLogId:requestLogId];
+        return;
+    }
+
+    struct stat st;
+    long long fileSize = 0;
+    if (fstat(fd, &st) == 0) fileSize = st.st_size;
+
+    NSString *downloadName = filePath.lastPathComponent ?: @"file";
+    NSString *header = [NSString stringWithFormat:
+        @"HTTP/1.1 200 OK\r\n"
+        @"Content-Type: application/octet-stream\r\n"
+        @"Content-Length: %lld\r\n"
+        @"Content-Disposition: attachment; filename=\"%@\"\r\n"
+        @"Connection: close\r\n"
+        @"\r\n",
+        fileSize, downloadName];
+    [self writeAll:clientSocket data:[header dataUsingEncoding:NSUTF8StringEncoding] requestLogId:requestLogId];
+
+    long long sent = 0;
+    char *chunk = malloc(MCP_UPLOAD_CHUNK);
+    if (chunk) {
+        ssize_t n;
+        while ((n = read(fd, chunk, MCP_UPLOAD_CHUNK)) > 0) {
+            NSData *data = [NSData dataWithBytesNoCopy:chunk length:(NSUInteger)n freeWhenDone:NO];
+            [self writeAll:clientSocket data:data requestLogId:nil];
+            sent += n;
+        }
+        free(chunk);
+    }
+    close(fd);
+    if (isTemporary) [[NSFileManager defaultManager] removeItemAtPath:diskPath error:nil];
+
+    [MCPLogger log:@"file_download req=%@ sock=%d ok=yes bytes=%lld privilegedTemp=%@",
+     requestLogId ?: @"-", clientSocket, sent, isTemporary ? @"yes" : @"no"];
 }
 
 static NSString *MCPRedactedLogText(NSString *s) {
@@ -1217,7 +1395,7 @@ static NSString *MCPLogId(id reqId) {
                 @"name": MCP_SERVER_NAME,
                 @"version": MCP_SERVER_VERSION
             },
-            @"instructions": @"Use ios-mcp to inspect and operate the connected iPhone.\n\nGetting started: call get_frontmost_app, get_screen_info, get_ui_elements, and screenshot to understand the current device state. get_screen_info includes device_state when SpringBoard exposes it. If locked is true, screen_on is false, the screenshot looks like the Lock Screen, or UI elements are from SpringBoard/Lock Screen, do not continue normal app automation until the device is awake/unlocked.\n\nLock screen handling: a single press_home only wakes or advances the Lock Screen and must not be treated as reaching the Home screen. Use wake_and_home when the device may be locked/off. The equivalent manual sequence is Power then Home when the screen is off, or Home twice when the Lock Screen is already visible. After wake_and_home, verify with screenshot/get_ui_elements/get_frontmost_app before continuing. The server enforces a lock guard: while locked or screen_off, interactive and mutating tools are blocked; only observation and recovery tools are allowed.\n\nTouch and gestures: use screen point coordinates for tap_screen, swipe_screen, long_press, double_tap, and drag_and_drop. For Flutter or custom-rendered apps, accessibility may expose only a container such as FlutterView; use screenshot plus coordinates in that case.\n\nText input: use input_text first for fast bulk text through system keyboard events. If input_text returns isError or reports failure/timeout, immediately retry the same text with type_text; do not repeat input_text. Use type_text for character-by-character input and press_key for special keys (enter, delete, tab, etc.).\n\nHardware buttons: press_home, press_power, press_volume_up, press_volume_down, toggle_mute, wake_and_home.\n\nClipboard: get_clipboard and set_clipboard to read/write clipboard contents.\n\nScreenshot: the screenshot tool returns MCP image content, not text — result.content[0].data contains the base64 JPEG payload and result.content[0].mimeType is usually image/jpeg.\n\nApp management: launch_app, kill_app, list_apps, list_running_apps, get_frontmost_app. launch_app waits until the target app is actually frontmost before returning, so do not immediately re-issue redundant foreground checks unless you need to verify a later transition. To install an app from the computer, first upload raw IPA bytes to POST /upload_file (for example: curl -H 'X-Filename: app.ipa' --data-binary @app.ipa http://device-ip:8090/upload_file). The upload response returns a device path; pass that path to install_app. To install an IPA already on the phone, call install_app directly with its device path. Unsigned or fakesigned IPAs are supported. To uninstall: use list_apps to find the bundle_id, then call uninstall_app.\n\nDevice control: get_brightness/set_brightness, get_volume/set_volume, open_url (supports http/https and URL schemes like tel://, prefs:root=WIFI, etc.).\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information. Pass debug=true only when diagnosing installation integrity to include bundled helper executable status.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; ios-mcp commands often run under /bin/sh where that may execute only once. Use seq or a while loop, and use at least --connect-timeout 3 plus --max-time 5 for /health.\n\nShell: run_command to execute shell commands on the device (timeout default 10s, max 30s)."
+            @"instructions": @"Use ios-mcp to inspect and operate the connected iPhone.\n\nGetting started: call get_frontmost_app, get_screen_info, get_ui_elements, and screenshot to understand the current device state. get_screen_info includes device_state when SpringBoard exposes it. If locked is true, screen_on is false, the screenshot looks like the Lock Screen, or UI elements are from SpringBoard/Lock Screen, do not continue normal app automation until the device is awake/unlocked.\n\nLock screen handling: a single press_home only wakes or advances the Lock Screen and must not be treated as reaching the Home screen. Use wake_and_home when the device may be locked/off. The equivalent manual sequence is Power then Home when the screen is off, or Home twice when the Lock Screen is already visible. After wake_and_home, verify with screenshot/get_ui_elements/get_frontmost_app before continuing. The server enforces a lock guard: while locked or screen_off, interactive and mutating tools are blocked; only observation and recovery tools are allowed.\n\nTouch and gestures: use screen point coordinates for tap_screen, swipe_screen, long_press, double_tap, and drag_and_drop. For Flutter or custom-rendered apps, accessibility may expose only a container such as FlutterView; use screenshot plus coordinates in that case.\n\nText input: use input_text first for fast bulk text through system keyboard events. If input_text returns isError or reports failure/timeout, immediately retry the same text with type_text; do not repeat input_text. Use type_text for character-by-character input and press_key for special keys (enter, delete, tab, etc.).\n\nHardware buttons: press_home, press_power, press_volume_up, press_volume_down, toggle_mute, wake_and_home.\n\nClipboard: get_clipboard and set_clipboard to read/write clipboard contents.\n\nScreenshot: the screenshot tool returns MCP image content, not text — result.content[0].data contains the base64 JPEG payload and result.content[0].mimeType is usually image/jpeg.\n\nApp management: launch_app, kill_app, list_apps, list_running_apps, get_frontmost_app. launch_app waits until the target app is actually frontmost before returning, so do not immediately re-issue redundant foreground checks unless you need to verify a later transition. To install an app from the computer, first upload raw IPA bytes to POST /upload_file (for example: curl -H 'X-Filename: app.ipa' --data-binary @app.ipa http://device-ip:8090/upload_file). The upload response returns a device path; pass that path to install_app. To install an IPA already on the phone, call install_app directly with its device path. Unsigned or fakesigned IPAs are supported. To uninstall: use list_apps to find the bundle_id, then call uninstall_app.\n\nDevice control: get_brightness/set_brightness, get_volume/set_volume, open_url (supports http/https and URL schemes like tel://, prefs:root=WIFI, etc.).\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information. Pass debug=true only when diagnosing installation integrity to include bundled helper executable status.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; ios-mcp commands often run under /bin/sh where that may execute only once. Use seq or a while loop, and use at least --connect-timeout 3 plus --max-time 5 for /health.\n\nShell: run_command to execute shell commands on the device (timeout default 10s, max 30s).\n\nReverse engineering and debugging: get_app_info returns an installed app's bundle path, data container (sandbox) path, App Group container paths, executable path, version, and entitlements — call it first to locate files. list_dir, read_file, and write_file operate on the device filesystem and fall back to the privileged mcp-root helper for protected paths (other apps' sandboxes, system dirs). read_file returns utf8 for text and base64 for binary; it is capped (default 512KB), so for large or binary files use GET /download_file?path=<device-path> to stream the full file (for example: curl 'http://device-ip:8090/download_file?path=/var/mobile/...' -o out.bin). get_syslog captures the live unified system log across all processes (the stream Console.app shows) for a few seconds — it is a live capture, so trigger the activity you want to observe during the window. get_crash_logs lists crash reports (filter by bundle_id), and read_crash_log returns a single report's full text. write_file is blocked while the device is locked or the screen is off."
         }
     };
 }
@@ -1298,6 +1476,50 @@ static NSString *MCPLogId(id reqId) {
                     @"y": @{@"type": @"number", @"description": @"Y coordinate in screen points"}
                 },
                 @"required": @[@"x", @"y"]
+            }
+        },
+        @{
+            @"name": @"tap_element",
+            @"description": @"Find a UI element by its text/accessibility label and tap it, instead of computing raw coordinates yourself. Matches against an element's accessibility text (label/title/identifier/value). Prefer this over tap_screen for reliable, layout-independent tapping. Returns tapped=true with the matched element, or tapped=false with a reason when no element matches.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"text": @{@"type": @"string", @"description": @"Text/label to match (case-insensitive substring by default). e.g. 'Sign In', '设置'."},
+                    @"identifier": @{@"type": @"string", @"description": @"Exact accessibility identifier/label to match (takes precedence over text, exact match)."},
+                    @"role": @{@"type": @"string", @"description": @"Optional element type filter: 'control' (interactive/labeled) or 'element'."},
+                    @"match": @{@"type": @"string", @"description": @"Text match mode: 'contains' (default) or 'exact'."},
+                    @"index": @{@"type": @"integer", @"description": @"When multiple elements match, which one to tap (0-based, default 0)."}
+                }
+            }
+        },
+        @{
+            @"name": @"wait_for_element",
+            @"description": @"Poll the UI until an element matching the given text/label/role appears (or until timeout). Use this to synchronize automation after an action that triggers a screen transition or async load, instead of sleeping or repeatedly calling get_ui_elements. Returns found=true with waited_ms once it appears, or found=false on timeout.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"text": @{@"type": @"string", @"description": @"Text/label to wait for (case-insensitive substring by default)."},
+                    @"identifier": @{@"type": @"string", @"description": @"Exact accessibility identifier/label to wait for (exact match)."},
+                    @"role": @{@"type": @"string", @"description": @"Optional element type filter: 'control' or 'element'."},
+                    @"match": @{@"type": @"string", @"description": @"Text match mode: 'contains' (default) or 'exact'."},
+                    @"timeout_ms": @{@"type": @"number", @"description": @"Max time to wait in milliseconds (default 5000, max 30000)."},
+                    @"interval_ms": @{@"type": @"number", @"description": @"Poll interval in milliseconds (default 500, min 100)."}
+                }
+            }
+        },
+        @{
+            @"name": @"wait_for_disappear",
+            @"description": @"Poll the UI until an element matching the given text/label/role is no longer present (or until timeout). Use this to wait for a loading spinner, overlay, or transition view to go away before continuing. Returns disappeared=true with waited_ms, or disappeared=false on timeout.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"text": @{@"type": @"string", @"description": @"Text/label that should disappear (case-insensitive substring by default)."},
+                    @"identifier": @{@"type": @"string", @"description": @"Exact accessibility identifier/label that should disappear (exact match)."},
+                    @"role": @{@"type": @"string", @"description": @"Optional element type filter: 'control' or 'element'."},
+                    @"match": @{@"type": @"string", @"description": @"Text match mode: 'contains' (default) or 'exact'."},
+                    @"timeout_ms": @{@"type": @"number", @"description": @"Max time to wait in milliseconds (default 5000, max 30000)."},
+                    @"interval_ms": @{@"type": @"number", @"description": @"Poll interval in milliseconds (default 500, min 100)."}
+                }
             }
         },
         @{
@@ -1422,6 +1644,31 @@ static NSString *MCPLogId(id reqId) {
                     @"debug": @{@"type": @"boolean", @"description": @"Include AX runtime and resolver diagnostics (default: false)"}
                 },
                 @"required": @[@"x", @"y"]
+            }
+        },
+        @{
+            @"name": @"ocr_screen",
+            @"description": @"Recognize text on the current screen via on-device OCR (Vision framework) and return each text block with screen-point coordinates. Use this when get_ui_elements/tap_element cannot see the content — games, Flutter/React Native/Unity apps, canvas-rendered UI, or text inside images. Each result includes a ready-to-use tap point. Pair with tap_screen to tap recognized text.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"languages": @{@"type": @"array", @"items": @{@"type": @"string"}, @"description": @"Recognition languages, e.g. ['zh-Hans','en-US']. Default ['zh-Hans','en-US']."},
+                    @"min_confidence": @{@"type": @"number", @"description": @"Drop results below this confidence 0..1 (default 0.3)."},
+                    @"region": @{@"type": @"object", @"description": @"Optional screen-point rect {x,y,width,height} to limit OCR to a region."},
+                    @"fast": @{@"type": @"boolean", @"description": @"Fast mode: ~10x faster (sub-second) but recognizes fewer items and is weaker on small/CJK text. Default false (accurate). Use fast for quick scans of large/Latin text."}
+                }
+            }
+        },
+        @{
+            @"name": @"describe_screen",
+            @"description": @"Get a single structured snapshot of the current screen for agent decision-making: frontmost app, interactive elements (with tap points), optionally an OCR text layer for content the accessibility tree misses, and optionally a base64 screenshot. Prefer this as the one-call 'look at the screen' interface instead of calling get_frontmost_app + get_ui_elements + ocr_screen separately.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"include_screenshot": @{@"type": @"boolean", @"description": @"Include a base64 JPEG screenshot (default false, saves tokens)."},
+                    @"include_ocr": @{@"type": @"boolean", @"description": @"Add an OCR text layer for content not in the accessibility tree (default false)."},
+                    @"clickable_only": @{@"type": @"boolean", @"description": @"Only return clickable elements (default true)."}
+                }
             }
         },
         // ---- Text input tools ----
@@ -1595,6 +1842,90 @@ static NSString *MCPLogId(id reqId) {
                 },
                 @"required": @[@"bundle_id"]
             }
+        },
+        // ---- Reverse-engineering: app info, filesystem, logs ----
+        @{
+            @"name": @"get_app_info",
+            @"description": @"Get detailed info for an installed app: bundle (.app) path, data container (sandbox) path, App Group shared container paths, main executable path, version, SDK/minimum OS version, and code-signing entitlements. Use this to locate an app's files before read_file/list_dir. Use list_apps to find the bundle_id first.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"App bundle identifier (e.g. com.example.app)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"list_dir",
+            @"description": @"List the contents of a directory on the device filesystem. Returns each entry's name, type (file/directory/symlink/...), size, permission bits, and modification time. Falls back to the privileged mcp-root helper for paths the server cannot read directly (other apps' sandbox containers, system directories). Combine with get_app_info to explore an app's data container.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute directory path on device (e.g. /var/mobile/Containers/Data/Application/<UUID> or /var/mobile)."}
+                },
+                @"required": @[@"path"]
+            }
+        },
+        @{
+            @"name": @"read_file",
+            @"description": @"Read a file from the device filesystem. Text files return encoding 'utf8'; binary files (plist/db/images/dumps) return encoding 'base64'. Output is capped (default 512KB, max 4MB); when truncated, use GET /download_file?path=<path> to stream the full file. Falls back to the privileged mcp-root helper for protected paths.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute file path on device."},
+                    @"max_bytes": @{@"type": @"number", @"description": @"Optional max bytes to read (default 524288, max 4194304)."},
+                    @"binary": @{@"type": @"boolean", @"description": @"Optional. Force base64 output even if the content looks like text. Default false."}
+                },
+                @"required": @[@"path"]
+            }
+        },
+        @{
+            @"name": @"write_file",
+            @"description": @"Write a file to the device filesystem, creating or overwriting it. content is interpreted per encoding: 'utf8' (default) or 'base64' for binary data. Falls back to the privileged mcp-root helper for protected paths. This is a mutating tool and is blocked while the device is locked or the screen is off.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute destination file path on device."},
+                    @"content": @{@"type": @"string", @"description": @"File content. Plain text for utf8, or a base64 string when encoding is base64."},
+                    @"encoding": @{@"type": @"string", @"description": @"Content encoding: 'utf8' (default) or 'base64'."}
+                },
+                @"required": @[@"path", @"content"]
+            }
+        },
+        @{
+            @"name": @"get_syslog",
+            @"description": @"Capture the live unified system log across ALL processes (the same stream Console.app shows), via the bundled mcp-logreader helper connected to diagnosticd. This is a LIVE capture: it collects log events arriving during a time window (last_seconds), not historical logs — trigger the activity you want to observe during the window. Optionally filter by process name and severity. Returns structured entries (process, pid, subsystem, category, level, message, date).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"process": @{@"type": @"string", @"description": @"Optional process name substring to filter by (e.g. an app's executable name like 'WeChat', or a daemon like 'locationd')."},
+                    @"level": @{@"type": @"string", @"description": @"Optional severity filter: 'error' or 'fault'. Omit or 'all' for all levels."},
+                    @"last_seconds": @{@"type": @"number", @"description": @"Live capture window in seconds (default 5, max 60). Events are collected for this duration before returning."},
+                    @"max_lines": @{@"type": @"number", @"description": @"Max entries to return (default 500, max 5000)."}
+                }
+            }
+        },
+        @{
+            @"name": @"get_crash_logs",
+            @"description": @"List crash reports (.ips/.crash) from the device's CrashReporter directories, newest first. Optionally filter by bundle id or process name prefix. Returns each report's name, path, size, and date; pass a path to read_crash_log for the full report.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional bundle id / process name prefix to filter crash reports (e.g. com.example.app or the executable name)."},
+                    @"limit": @{@"type": @"number", @"description": @"Max number of reports to return (default 30)."}
+                }
+            }
+        },
+        @{
+            @"name": @"read_crash_log",
+            @"description": @"Read the full text of a single crash report by its path (obtained from get_crash_logs).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute path to the crash report file, from get_crash_logs."}
+                },
+                @"required": @[@"path"]
+            }
         }
     ];
 
@@ -1651,6 +1982,12 @@ static NSString *MCPLogId(id reqId) {
     // Touch tools
     else if ([toolName isEqualToString:@"tap_screen"]) {
         return [self executeTap:reqId args:args];
+    } else if ([toolName isEqualToString:@"tap_element"]) {
+        return [self executeTapElement:reqId args:args];
+    } else if ([toolName isEqualToString:@"wait_for_element"]) {
+        return [self executeWaitForElement:reqId args:args waitForAppear:YES];
+    } else if ([toolName isEqualToString:@"wait_for_disappear"]) {
+        return [self executeWaitForElement:reqId args:args waitForAppear:NO];
     } else if ([toolName isEqualToString:@"swipe_screen"]) {
         return [self executeSwipe:reqId args:args];
     }
@@ -1683,6 +2020,10 @@ static NSString *MCPLogId(id reqId) {
         return [self executeGetUIElements:reqId args:args];
     } else if ([toolName isEqualToString:@"get_element_at_point"]) {
         return [self executeGetElementAtPoint:reqId args:args];
+    } else if ([toolName isEqualToString:@"ocr_screen"]) {
+        return [self executeOCRScreen:reqId args:args];
+    } else if ([toolName isEqualToString:@"describe_screen"]) {
+        return [self executeDescribeScreen:reqId args:args];
     }
     // Text input tools
     else if ([toolName isEqualToString:@"input_text"]) {
@@ -1729,6 +2070,22 @@ static NSString *MCPLogId(id reqId) {
         return [self executeInstallApp:reqId args:args];
     } else if ([toolName isEqualToString:@"uninstall_app"]) {
         return [self executeUninstallApp:reqId args:args];
+    }
+    // Reverse-engineering tools
+    else if ([toolName isEqualToString:@"get_app_info"]) {
+        return [self executeGetAppInfo:reqId args:args];
+    } else if ([toolName isEqualToString:@"list_dir"]) {
+        return [self executeListDir:reqId args:args];
+    } else if ([toolName isEqualToString:@"read_file"]) {
+        return [self executeReadFile:reqId args:args];
+    } else if ([toolName isEqualToString:@"write_file"]) {
+        return [self executeWriteFile:reqId args:args];
+    } else if ([toolName isEqualToString:@"get_syslog"]) {
+        return [self executeGetSyslog:reqId args:args];
+    } else if ([toolName isEqualToString:@"get_crash_logs"]) {
+        return [self executeGetCrashLogs:reqId args:args];
+    } else if ([toolName isEqualToString:@"read_crash_log"]) {
+        return [self executeReadCrashLog:reqId args:args];
     }
     return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown tool: %@", toolName]];
 }
@@ -1931,6 +2288,156 @@ static NSString *MCPLogId(id reqId) {
         return [self mcpSuccess:reqId text:[NSString stringWithFormat:@"Tapped at (%.1f, %.1f)", point.x, point.y]];
     }
     return [self mcpSuccess:reqId text:[NSString stringWithFormat:@"Tap failed: %@", err ?: @"timeout"] isError:YES];
+}
+
+#pragma mark - Element-level automation (tap_element / wait_for_*)
+
+// Synchronously fetch the current compact UI elements payload (clickableOnly optional).
+- (NSDictionary *)fetchCompactElementsClickableOnly:(BOOL)clickableOnly {
+    __block NSDictionary *payload = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[AccessibilityManager sharedInstance] getCompactUIElementsWithMaxElements:0
+                                                                   visibleOnly:YES
+                                                                 clickableOnly:clickableOnly
+                                                                    completion:^(NSDictionary *result, NSString *error) {
+        payload = result;
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+    return payload;
+}
+
+// Parse the common element-matching args shared by the three tools.
+- (BOOL)parseElementMatchArgs:(NSDictionary *)args
+                         text:(NSString **)outText
+                        exact:(BOOL *)outExact
+                         type:(NSString **)outType
+                        index:(NSInteger *)outIndex
+                        error:(NSString **)outError {
+    NSString *text = nil, *identifier = nil, *role = nil, *match = nil;
+    double indexValue = 0;
+    if (!MCPStringFromArgs(args, @"text", NO, &text, outError) ||
+        !MCPStringFromArgs(args, @"identifier", NO, &identifier, outError) ||
+        !MCPStringFromArgs(args, @"role", NO, &role, outError) ||
+        !MCPStringFromArgs(args, @"match", NO, &match, outError) ||
+        !MCPNumberFromArgs(args, @"index", 0, NO, &indexValue, outError)) {
+        return NO;
+    }
+    // identifier is an alias for an exact text match; text + contains is the default.
+    BOOL exact = [match isEqualToString:@"exact"];
+    NSString *needle = text;
+    if (identifier.length > 0) { needle = identifier; exact = YES; }
+    *outText = needle;
+    *outExact = exact;
+    *outType = role; // "control" / "element"
+    *outIndex = (NSInteger)indexValue;
+    return YES;
+}
+
+- (NSDictionary *)executeTapElement:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil, *text = nil, *type = nil;
+    BOOL exact = NO;
+    NSInteger index = 0;
+    if (![self parseElementMatchArgs:args text:&text exact:&exact type:&type index:&index error:&paramError]) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (text.length == 0 && type.length == 0) {
+        return [self mcpError:reqId code:-32602 message:@"tap_element requires at least one of: text, identifier, role"];
+    }
+
+    NSDictionary *payload = [self fetchCompactElementsClickableOnly:NO];
+    NSArray<NSDictionary *> *matches = MCPMatchingElements(payload, text, exact, type, NO, YES);
+
+    if (matches.count == 0) {
+        NSDictionary *result = @{@"tapped": @NO, @"reason": @"no_match",
+                                 @"query": @{@"text": text ?: @"", @"role": type ?: @"", @"exact": @(exact)}};
+        return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result] isError:YES];
+    }
+    if (index < 0 || index >= (NSInteger)matches.count) {
+        NSDictionary *result = @{@"tapped": @NO, @"reason": @"index_out_of_range",
+                                 @"matched_count": @(matches.count), @"index": @(index)};
+        return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result] isError:YES];
+    }
+
+    NSDictionary *target = matches[(NSUInteger)index];
+    NSDictionary *tap = MCPCenterTapPointForElement(target);
+    double tapX = 0, tapY = 0;
+    if (![tap[@"x"] respondsToSelector:@selector(doubleValue)] || ![tap[@"y"] respondsToSelector:@selector(doubleValue)]) {
+        NSDictionary *result = @{@"tapped": @NO, @"reason": @"no_tap_point", @"element": MCPElementSummary(target)};
+        return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result] isError:YES];
+    }
+    tapX = [tap[@"x"] doubleValue];
+    tapY = [tap[@"y"] doubleValue];
+
+    __block BOOL ok = NO; __block NSString *err = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[IOSMCPHIDManager sharedInstance] tapAtPoint:CGPointMake(tapX, tapY) completion:^(BOOL success, NSString *error) {
+        ok = success; err = error; dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+
+    if (ok) {
+        NSDictionary *result = @{@"tapped": @YES, @"matched_count": @(matches.count),
+                                 @"index": @(index), @"point": @{@"x": @(tapX), @"y": @(tapY)},
+                                 @"element": MCPElementSummary(target)};
+        return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+    }
+    NSDictionary *result = @{@"tapped": @NO, @"reason": @"tap_failed", @"error": err ?: @"timeout",
+                             @"element": MCPElementSummary(target)};
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result] isError:YES];
+}
+
+- (NSDictionary *)executeWaitForElement:(id)reqId args:(NSDictionary *)args waitForAppear:(BOOL)waitForAppear {
+    NSString *paramError = nil, *text = nil, *type = nil;
+    BOOL exact = NO;
+    NSInteger index = 0;
+    double timeoutMs = 5000, intervalMs = 500;
+    if (![self parseElementMatchArgs:args text:&text exact:&exact type:&type index:&index error:&paramError] ||
+        !MCPNumberFromArgs(args, @"timeout_ms", 5000, NO, &timeoutMs, &paramError) ||
+        !MCPNumberFromArgs(args, @"interval_ms", 500, NO, &intervalMs, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (text.length == 0 && type.length == 0) {
+        return [self mcpError:reqId code:-32602 message:@"requires at least one of: text, identifier, role"];
+    }
+    if (timeoutMs <= 0) timeoutMs = 5000;
+    if (timeoutMs > 30000) timeoutMs = 30000;
+    if (intervalMs < 100) intervalMs = 100;
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeoutMs / 1000.0];
+    NSDate *start = [NSDate date];
+    NSDictionary *lastMatch = nil;
+
+    while (1) {
+        NSDictionary *payload = [self fetchCompactElementsClickableOnly:NO];
+        NSArray<NSDictionary *> *matches = MCPMatchingElements(payload, text, exact, type, NO, YES);
+        BOOL present = (matches.count > 0);
+        lastMatch = present ? matches.firstObject : nil;
+
+        BOOL conditionMet = waitForAppear ? present : !present;
+        if (conditionMet) {
+            NSInteger waited = (NSInteger)([[NSDate date] timeIntervalSinceDate:start] * 1000.0);
+            NSMutableDictionary *result = [NSMutableDictionary dictionary];
+            if (waitForAppear) {
+                result[@"found"] = @YES;
+                result[@"matched_count"] = @(matches.count);
+                if (lastMatch) result[@"element"] = MCPElementSummary(lastMatch);
+            } else {
+                result[@"disappeared"] = @YES;
+            }
+            result[@"waited_ms"] = @(waited);
+            return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+        }
+
+        if ([[NSDate date] compare:deadline] != NSOrderedAscending) break;
+        usleep((useconds_t)(intervalMs * 1000));
+    }
+
+    NSInteger waited = (NSInteger)([[NSDate date] timeIntervalSinceDate:start] * 1000.0);
+    NSDictionary *result = waitForAppear
+        ? @{@"found": @NO, @"waited_ms": @(waited)}
+        : @{@"disappeared": @NO, @"waited_ms": @(waited)};
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result] isError:YES];
 }
 
 - (NSDictionary *)executeSwipe:(id)reqId args:(NSDictionary *)args {
@@ -2142,7 +2649,7 @@ static NSString *MCPLogId(id reqId) {
         @"rect",
         @"visible_rect"
     ]);
-    NSDictionary *tap = MCPRandomizedTapPointForElement(element);
+    NSDictionary *tap = MCPCenterTapPointForElement(element);
     if (tap.count > 0) {
         sanitized[@"tap"] = tap;
     }
@@ -2447,6 +2954,112 @@ static NSString *MCPLogId(id reqId) {
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:responsePayload options:0 error:nil];
     NSString *jsonStr = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
     return [self mcpSuccess:reqId text:jsonStr isError:YES];
+}
+
+#pragma mark - OCR / Screen Description
+
+- (NSDictionary *)executeOCRScreen:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    double minConfidence = 0.3;
+    if (!MCPNumberFromArgs(args, @"min_confidence", 0.3, NO, &minConfidence, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (minConfidence < 0) minConfidence = 0;
+    if (minConfidence > 1) minConfidence = 1;
+
+    NSArray<NSString *> *languages = nil;
+    id langs = args[@"languages"];
+    if ([langs isKindOfClass:[NSArray class]]) {
+        NSMutableArray *valid = [NSMutableArray array];
+        for (id l in langs) { if ([l isKindOfClass:[NSString class]]) [valid addObject:l]; }
+        if (valid.count > 0) languages = valid;
+    }
+    NSDictionary *region = [args[@"region"] isKindOfClass:[NSDictionary class]] ? args[@"region"] : nil;
+    BOOL fast = NO;
+    if (!MCPBoolFromArgs(args, @"fast", NO, &fast, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    NSString *err = nil;
+    NSDictionary *result = [[OCRManager sharedInstance] recognizeTextWithLanguages:languages
+                                                                    minConfidence:minConfidence
+                                                                           region:region
+                                                                             fast:fast
+                                                                            error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"OCR failed") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+}
+
+- (NSDictionary *)executeDescribeScreen:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    BOOL includeScreenshot = NO, includeOCR = NO, clickableOnly = YES;
+    if (!MCPBoolFromArgs(args, @"include_screenshot", NO, &includeScreenshot, &paramError) ||
+        !MCPBoolFromArgs(args, @"include_ocr", NO, &includeOCR, &paramError) ||
+        !MCPBoolFromArgs(args, @"clickable_only", YES, &clickableOnly, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+
+    // Frontmost app
+    NSDictionary *frontmost = [[AccessibilityManager sharedInstance] frontmostApplicationInfo];
+    if ([frontmost isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *fm = [NSMutableDictionary dictionary];
+        if ([frontmost[@"bundleId"] isKindOfClass:[NSString class]]) fm[@"bundleId"] = frontmost[@"bundleId"];
+        if ([frontmost[@"name"] isKindOfClass:[NSString class]]) fm[@"name"] = frontmost[@"name"];
+        if (fm.count) out[@"frontmost"] = fm;
+    }
+
+    // Accessibility elements (reuse compact crawl)
+    __block NSDictionary *uiPayload = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[AccessibilityManager sharedInstance] getCompactUIElementsWithMaxElements:0
+                                                                   visibleOnly:YES
+                                                                 clickableOnly:clickableOnly
+                                                                    completion:^(NSDictionary *result, NSString *error) {
+        uiPayload = result;
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+
+    NSArray *elements = [uiPayload[@"elements"] isKindOfClass:[NSArray class]] ? uiPayload[@"elements"] : @[];
+    NSMutableArray *outElements = [NSMutableArray array];
+    for (id e in elements) {
+        if ([e isKindOfClass:[NSDictionary class]]) [outElements addObject:MCPElementSummary(e)];
+    }
+    out[@"elements"] = outElements;
+    out[@"element_count"] = @(outElements.count);
+    if ([uiPayload[@"screen"] isKindOfClass:[NSDictionary class]]) out[@"screen"] = uiPayload[@"screen"];
+    NSString *source = @"accessibility";
+
+    // Optional OCR layer
+    if (includeOCR) {
+        NSString *ocrErr = nil;
+        NSDictionary *ocr = [[OCRManager sharedInstance] recognizeTextWithLanguages:nil
+                                                                      minConfidence:0.3
+                                                                             region:nil
+                                                                               fast:NO
+                                                                              error:&ocrErr];
+        if ([ocr[@"texts"] isKindOfClass:[NSArray class]]) {
+            out[@"ocr_texts"] = ocr[@"texts"];
+            source = @"accessibility+ocr";
+            if (!out[@"screen"] && [ocr[@"screen"] isKindOfClass:[NSDictionary class]]) out[@"screen"] = ocr[@"screen"];
+        }
+    }
+
+    // Optional screenshot
+    if (includeScreenshot) {
+        NSDictionary *shot = [[ScreenManager sharedInstance] takeScreenshotPayload];
+        if ([shot[@"data"] isKindOfClass:[NSString class]]) {
+            out[@"screenshot"] = shot[@"data"];
+            out[@"screenshot_mime"] = shot[@"mimeType"] ?: @"image/jpeg";
+        }
+    }
+
+    out[@"source"] = source;
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:out]];
 }
 
 #pragma mark - Text Input Execution
@@ -3059,6 +3672,152 @@ static BOOL MCPSetSystemBrightness(CGFloat brightness) {
         return [self mcpSuccess:reqId text:[NSString stringWithFormat:@"Uninstalled %@", bundleId]];
     }
     return [self mcpSuccess:reqId text:[NSString stringWithFormat:@"Uninstall failed: %@", err ?: @"unknown"] isError:YES];
+}
+
+#pragma mark - Reverse-engineering Tool Execution
+
+// Serialize a dictionary result into pretty JSON text for the MCP text payload.
+- (NSString *)jsonTextForDictionary:(NSDictionary *)dict {
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:dict
+                                                       options:NSJSONWritingPrettyPrinted
+                                                         error:nil];
+    NSString *text = jsonData ? [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding] : nil;
+    return text ?: @"{}";
+}
+
+- (NSDictionary *)executeGetAppInfo:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *bundleId = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    NSString *err = nil;
+    NSDictionary *info = [[AppManager sharedInstance] appInfoForBundleId:bundleId error:&err];
+    if (!info) {
+        return [self mcpSuccess:reqId text:(err ?: @"Failed to read app info") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:info]];
+}
+
+- (NSDictionary *)executeListDir:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *path = nil;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    NSString *err = nil;
+    NSDictionary *result = [[FileSystemManager sharedInstance] listDirectoryAtPath:path error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"Failed to list directory") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+}
+
+- (NSDictionary *)executeReadFile:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *path = nil;
+    double maxBytes = 0;
+    BOOL binary = NO;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError) ||
+        !MCPNumberFromArgs(args, @"max_bytes", 0, NO, &maxBytes, &paramError) ||
+        !MCPBoolFromArgs(args, @"binary", NO, &binary, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (maxBytes < 0) maxBytes = 0;
+
+    NSString *err = nil;
+    NSDictionary *result = [[FileSystemManager sharedInstance] readFileAtPath:path
+                                                                     maxBytes:(NSUInteger)maxBytes
+                                                                  forceBinary:binary
+                                                                        error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"Failed to read file") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+}
+
+- (NSDictionary *)executeWriteFile:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *path = nil;
+    NSString *content = nil;
+    NSString *encoding = nil;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError) ||
+        !MCPStringFromArgs(args, @"content", YES, &content, &paramError) ||
+        !MCPStringFromArgs(args, @"encoding", NO, &encoding, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (encoding.length == 0) encoding = @"utf8";
+
+    NSString *err = nil;
+    NSDictionary *result = [[FileSystemManager sharedInstance] writeFileAtPath:path
+                                                                       content:content
+                                                                      encoding:encoding
+                                                                         error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"Failed to write file") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+}
+
+- (NSDictionary *)executeGetSyslog:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *process = nil;
+    NSString *level = nil;
+    double lastSeconds = 60;
+    double maxLines = 0;
+    if (!MCPStringFromArgs(args, @"process", NO, &process, &paramError) ||
+        !MCPStringFromArgs(args, @"level", NO, &level, &paramError) ||
+        !MCPNumberFromArgs(args, @"last_seconds", 60, NO, &lastSeconds, &paramError) ||
+        !MCPNumberFromArgs(args, @"max_lines", 0, NO, &maxLines, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    NSString *err = nil;
+    NSDictionary *result = [[LogManager sharedInstance] syslogWithProcess:process
+                                                                    level:level
+                                                              lastSeconds:(NSInteger)lastSeconds
+                                                                 maxLines:(NSInteger)maxLines
+                                                                    error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"Failed to query system log") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+}
+
+- (NSDictionary *)executeGetCrashLogs:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *bundleId = nil;
+    double limit = 0;
+    if (!MCPStringFromArgs(args, @"bundle_id", NO, &bundleId, &paramError) ||
+        !MCPNumberFromArgs(args, @"limit", 0, NO, &limit, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    NSString *err = nil;
+    NSDictionary *result = [[LogManager sharedInstance] crashLogsForBundleId:bundleId
+                                                                       limit:(NSInteger)limit
+                                                                       error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"Failed to list crash logs") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
+}
+
+- (NSDictionary *)executeReadCrashLog:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil;
+    NSString *path = nil;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+
+    NSString *err = nil;
+    NSDictionary *result = [[LogManager sharedInstance] crashLogContentAtPath:path error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"Failed to read crash log") isError:YES];
+    }
+    return [self mcpSuccess:reqId text:[self jsonTextForDictionary:result]];
 }
 
 #pragma mark - Response Builders

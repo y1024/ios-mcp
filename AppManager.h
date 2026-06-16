@@ -28,4 +28,9 @@
 /// Uninstall an app by bundle identifier
 - (BOOL)uninstallApp:(NSString *)bundleId error:(NSString **)error;
 
+/// Detailed info for a single installed app: bundle/data/group container paths,
+/// executable path, version, entitlements, and signing identity. Returns nil with
+/// *error when the app is not found.
+- (NSDictionary *)appInfoForBundleId:(NSString *)bundleId error:(NSString **)error;
+
 @end
