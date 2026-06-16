@@ -1654,7 +1654,8 @@ static NSString *MCPLogId(id reqId) {
                 @"properties": @{
                     @"languages": @{@"type": @"array", @"items": @{@"type": @"string"}, @"description": @"Recognition languages, e.g. ['zh-Hans','en-US']. Default ['zh-Hans','en-US']."},
                     @"min_confidence": @{@"type": @"number", @"description": @"Drop results below this confidence 0..1 (default 0.3)."},
-                    @"region": @{@"type": @"object", @"description": @"Optional screen-point rect {x,y,width,height} to limit OCR to a region."}
+                    @"region": @{@"type": @"object", @"description": @"Optional screen-point rect {x,y,width,height} to limit OCR to a region."},
+                    @"fast": @{@"type": @"boolean", @"description": @"Fast mode: ~10x faster (sub-second) but recognizes fewer items and is weaker on small/CJK text. Default false (accurate). Use fast for quick scans of large/Latin text."}
                 }
             }
         },
@@ -2974,11 +2975,16 @@ static NSString *MCPLogId(id reqId) {
         if (valid.count > 0) languages = valid;
     }
     NSDictionary *region = [args[@"region"] isKindOfClass:[NSDictionary class]] ? args[@"region"] : nil;
+    BOOL fast = NO;
+    if (!MCPBoolFromArgs(args, @"fast", NO, &fast, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
 
     NSString *err = nil;
     NSDictionary *result = [[OCRManager sharedInstance] recognizeTextWithLanguages:languages
                                                                     minConfidence:minConfidence
                                                                            region:region
+                                                                             fast:fast
                                                                             error:&err];
     if (!result) {
         return [self mcpSuccess:reqId text:(err ?: @"OCR failed") isError:YES];
@@ -3034,6 +3040,7 @@ static NSString *MCPLogId(id reqId) {
         NSDictionary *ocr = [[OCRManager sharedInstance] recognizeTextWithLanguages:nil
                                                                       minConfidence:0.3
                                                                              region:nil
+                                                                               fast:NO
                                                                               error:&ocrErr];
         if ([ocr[@"texts"] isKindOfClass:[NSArray class]]) {
             out[@"ocr_texts"] = ocr[@"texts"];

@@ -10,10 +10,13 @@
 ///   languages:     recognition languages (e.g. @[@"zh-Hans", @"en"]); nil = default.
 ///   minConfidence: drop results below this confidence (0..1).
 ///   region:        optional screen-point rect {x,y,width,height} to limit OCR; nil = full screen.
+///   fast:          YES uses Vision's fast recognition (~10x faster, fewer/less-accurate
+///                  results, weaker on small/CJK text); NO uses accurate (default).
 /// Returns a dict with "texts" (text/confidence/rect/tap), "count", "screen", or nil with *error.
 - (NSDictionary *)recognizeTextWithLanguages:(NSArray<NSString *> *)languages
                                minConfidence:(double)minConfidence
                                       region:(NSDictionary *)region
+                                        fast:(BOOL)fast
                                        error:(NSString **)error;
 
 @end

@@ -22,9 +22,39 @@ static double OCRNum(NSDictionary *d, NSString *k) {
     return [v respondsToSelector:@selector(doubleValue)] ? [v doubleValue] : 0.0;
 }
 
+// Downsample a CGImage so its longest edge is at most maxEdge pixels, via CoreGraphics.
+// Vision text recognition does not need full-resolution input; shrinking a large iPad
+// capture (e.g. 1620x2160) cuts recognition time several fold. Returns NULL if no
+// downsample is needed or on failure (caller then keeps the original). Coordinate mapping
+// is unaffected: results are mapped back using the logical UIImage.size, not pixel size.
+static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETURNS_RETAINED {
+    if (!src) return NULL;
+    size_t w = CGImageGetWidth(src);
+    size_t h = CGImageGetHeight(src);
+    size_t longEdge = MAX(w, h);
+    if (longEdge == 0 || longEdge <= (size_t)maxEdge) return NULL;
+
+    double scale = maxEdge / (double)longEdge;
+    size_t nw = (size_t)(w * scale);
+    size_t nh = (size_t)(h * scale);
+    if (nw == 0 || nh == 0) return NULL;
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(NULL, nw, nh, 8, 0, cs,
+                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return NULL;
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationMedium);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, nw, nh), src);
+    CGImageRef out = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    return out;
+}
+
 - (NSDictionary *)recognizeTextWithLanguages:(NSArray<NSString *> *)languages
                                minConfidence:(double)minConfidence
                                       region:(NSDictionary *)region
+                                        fast:(BOOL)fast
                                        error:(NSString **)error {
     if (error) *error = nil;
 
@@ -47,8 +77,8 @@ static double OCRNum(NSDictionary *d, NSString *k) {
             visionError = err;
             observations = (NSArray<VNRecognizedTextObservation *> *)req.results;
         }];
-        request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
-        request.usesLanguageCorrection = YES;
+        request.recognitionLevel = fast ? VNRequestTextRecognitionLevelFast : VNRequestTextRecognitionLevelAccurate;
+        request.usesLanguageCorrection = !fast; // fast 模式跳过语言矫正以最大化速度
         if (languages.count > 0) {
             request.recognitionLanguages = languages;
         } else {
@@ -68,9 +98,37 @@ static double OCRNum(NSDictionary *d, NSString *k) {
             }
         }
 
-        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image.CGImage options:@{}];
+        // Downsample large captures before OCR (longest edge cap). Speeds up Vision on
+        // high-res iPad screens; coordinates still map back via the logical image.size.
+        CGImageRef ocrImage = image.CGImage;
+        CGImageRef downsampled = OCRCreateDownsampled(image.CGImage, 1600.0);
+        if (downsampled) ocrImage = downsampled;
+
+        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:ocrImage options:@{}];
         NSError *performError = nil;
         BOOL ok = [handler performRequests:@[request] error:&performError];
+
+        // iOS 14's Vision can fail the accurate recognition level with an internal error
+        // ("VNRecognizeTextRequest produced an internal error"). Fall back to the fast level
+        // once so OCR still returns results instead of failing outright.
+        if ((!ok || visionError) && !fast) {
+            OCR_LOG(@"accurate failed (%@), retrying with fast level",
+                    (performError ?: visionError).localizedDescription ?: @"?");
+            observations = nil; visionError = nil;
+            VNRecognizeTextRequest *fastReq = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:^(VNRequest *req, NSError *err) {
+                visionError = err;
+                observations = (NSArray<VNRecognizedTextObservation *> *)req.results;
+            }];
+            fastReq.recognitionLevel = VNRequestTextRecognitionLevelFast;
+            fastReq.usesLanguageCorrection = NO;
+            fastReq.recognitionLanguages = request.recognitionLanguages;
+            fastReq.regionOfInterest = request.regionOfInterest;
+            VNImageRequestHandler *h2 = [[VNImageRequestHandler alloc] initWithCGImage:ocrImage options:@{}];
+            performError = nil;
+            ok = [h2 performRequests:@[fastReq] error:&performError];
+        }
+
+        if (downsampled) CGImageRelease(downsampled);
         if (!ok || visionError) {
             NSString *msg = (performError ?: visionError).localizedDescription ?: @"Vision OCR failed";
             if (error) *error = msg;
