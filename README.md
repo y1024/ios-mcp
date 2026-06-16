@@ -12,15 +12,17 @@ iOS MCP 是一个运行在越狱 iPhone 上的 [MCP (Model Context Protocol)](ht
 | **硬件按键** | `press_home` `press_power` `press_volume_up` `press_volume_down` `toggle_mute` `wake_and_home` | HID 模拟物理按键，锁屏/熄屏唤醒 |
 | **文字输入** | `input_text` `type_text` `press_key` | 剪贴板快速输入 / HID 逐字模拟 / 特殊键 |
 | **截图** | `screenshot` `get_screen_info` | Base64 JPEG 截图、屏幕尺寸与方向 |
-| **App 管理** | `launch_app` `kill_app` `list_apps` `list_running_apps` `get_frontmost_app` `install_app` `uninstall_app` | 启动/关闭/安装/卸载 App |
-| **无障碍** | `get_ui_elements` `get_element_at_point` | 获取 UI 节点树、坐标元素查询 |
+| **App 管理** | `launch_app` `kill_app` `list_apps` `list_running_apps` `get_frontmost_app` `get_app_info` `install_app` `uninstall_app` | 启动/关闭/安装/卸载 App，查询 App 沙盒/容器路径与 entitlements |
+| **无障碍 / 元素操作** | `get_ui_elements` `get_element_at_point` `tap_element` `wait_for_element` `wait_for_disappear` `ocr_screen` `describe_screen` | 获取 UI 节点树、坐标元素查询，按文本/标签点击元素、等待元素出现或消失，屏幕 OCR 文字识别与定位、聚合屏幕快照 |
 | **剪贴板** | `get_clipboard` `set_clipboard` | 读写剪贴板内容 |
+| **文件系统** | `list_dir` `read_file` `write_file` | 目录列举、文件读写（支持文本与二进制） |
+| **日志** | `get_syslog` `get_crash_logs` `read_crash_log` | 全 App 实时系统日志、崩溃日志列举与读取 |
 | **设备控制** | `get_brightness` `set_brightness` `get_volume` `set_volume` | 亮度、音量 |
 | **设备信息** | `get_device_info` | 型号、iOS 版本、电池、存储、内存、越狱方式 |
 | **URL** | `open_url` | 打开链接或 URL Scheme |
 | **Shell** | `run_command` | 执行 Shell 命令 |
 
-共 **34** 个 MCP 工具，覆盖 iOS 设备自动化的主要场景。
+共 **46** 个 MCP 工具，覆盖 iOS 设备自动化与逆向调试的主要场景。
 
 ## 运行要求
 
@@ -70,7 +72,7 @@ http://设备IP:8090/health
 3. 返回以下内容表示服务启动正常：
 
 ```json
-{"status":"ok","server":"ios-mcp","version":"1.1.2"}
+{"status":"ok","server":"ios-mcp","version":"1.2.0"}
 ```
 
 ## 使用
@@ -81,12 +83,20 @@ http://设备IP:8090/health
   <img src="screenshots/settings.jpeg" alt="iOS MCP 设置" width="300">
 </p>
 
+下载设备上的大文件或二进制文件时，可直接访问 HTTP 端点，避免 base64 截断：
+
+```bash
+curl 'http://设备IP:8090/download_file?path=/var/mobile/...' -o output.bin
+```
+
 
 ## 安全说明
 
 - MCP 服务无内置认证，建议仅在局域网环境下使用
 - 锁屏或熄屏时，服务端会拦截点击、滑动、输入、启动 App、Shell 等交互/写入类工具，只放行状态查询、截图和唤醒恢复类工具
 - `run_command` 工具可执行任意 Shell 命令，请谨慎使用
+- `read_file` / `write_file` / `download_file` 可读写 MCP 服务进程权限范围内的设备路径，与 `run_command` 风险等级一致，请仅在可信网络使用
+- `get_syslog` 通过 `mcp-logreader`（签 `com.apple.private.logging.stream` entitlement）读取全 App 实时日志，可能包含敏感信息，请仅在可信网络使用
 - `mcp-root` 提供 root 提权能力，仅限包内工具使用
 
 ## 社区交流
@@ -95,10 +105,10 @@ http://设备IP:8090/health
 
 | 微信交流群（6群开放中） | 公众号 |
 |---|---|
-| 1群：已满<br>2群：已满<br>3群：已满<br>4群：已满<br>5群：已满<br>6群：开放中 | `移动端Android和iOS开发技术分享` |
+| 1群：已满<br>2群：已满<br>3群：已满<br>4群：已满<br>5群：已满<br>6群：已满<br>7群：开放中 | `移动端Android和iOS开发技术分享` |
 | <img src="https://raw.githubusercontent.com/witchan/Imgur/main/group6_qr.JPG" alt="iOS MCP 微信 6 群二维码" width="260"> | <img src="prefs/Resources/wechat_qr.jpg" alt="移动端Android和iOS开发技术分享 公众号二维码" width="220"> |
 
-> 6群二维码如已过期，请添加微信 `witchan028` 或关注公众号 `移动端Android和iOS开发技术分享` 获取最新入群方式。
+> 7群二维码如已过期，请添加微信 `witchan028` 或关注公众号 `移动端Android和iOS开发技术分享` 获取最新入群方式。
 
 欢迎添加微信或关注公众号，获取最新动态与入群方式。
 

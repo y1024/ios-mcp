@@ -376,6 +376,22 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
     return nil;
 }
 
+- (UIImage *)captureScreenImage {
+    __block UIImage *image = nil;
+    dispatch_block_t block = ^{
+        image = [self privateScreenshotImage];
+        if (!image) {
+            image = [self fallbackScreenshotImage];
+        }
+    };
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), block);
+    }
+    return image;
+}
+
 - (UIImage *)screenshotImageFromRenderServerCapture {
     if (!_CARenderServerCaptureDisplayFunc) return nil;
 
